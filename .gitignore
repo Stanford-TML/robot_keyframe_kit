@@ -210,6 +210,8 @@ __marimo__/
 .cursor/
 MUJOCO_LOG.TXT
 PLAN.md
+examples/
+keyframes/
 
 # Build artifacts
 dist/
