@@ -1,0 +1,30 @@
+# Include essential files
+include LICENSE
+include README.md
+include pyproject.toml
+
+# Include source code
+recursive-include src *.py
+
+# Exclude examples (too large - contains mesh files)
+prune examples
+
+# Exclude saved keyframes
+prune keyframes
+
+# Exclude development files
+exclude PLAN.md
+exclude MUJOCO_LOG.TXT
+prune .cursor
+
+# Exclude common unwanted files
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__
+global-exclude *.egg-info
+global-exclude .DS_Store
+global-exclude *.lz4
+global-exclude *.stl
+global-exclude *.dae
+global-exclude *.blend
+

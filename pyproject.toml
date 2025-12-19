@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot-keyframe-kit"
+version = "0.1.0"
+description = "A generalizable Viser-based keyframe editor for any MuJoCo robot"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    {name = "Stanford TML", email = "yuming29@stanford.edu"}
+]
+maintainers = [
+    {name = "Stanford TML", email = "yuming29@stanford.edu"}
+]
+keywords = ["robotics", "mujoco", "keyframe", "animation", "viser", "motion-planning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "mujoco>=3.0",
+    "viser-keyframe==1.0.18",
+    "numpy",
+    "scipy",
+    "joblib",
+    "trimesh",
+    "lz4",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/Stanford-TML/robot_keyframe_kit"
+Repository = "https://github.com/Stanford-TML/robot_keyframe_kit"
+
+[project.scripts]
+keyframe-editor = "robot_keyframe_kit.editor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+robot_keyframe_kit = ["py.typed"]
+
+# Exclude examples and keyframes from the distribution
+[tool.setuptools.exclude-package-data]
+"*" = ["examples/*", "keyframes/*", "*.lz4", "*.stl", "*.dae"]
+
+[tool.black]
+line-length = 88
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "I"]
+
+
