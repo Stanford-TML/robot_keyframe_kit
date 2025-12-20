@@ -106,9 +106,12 @@ class ViserKeyframeEditor:
         self.parallel_linkages: Dict[str, Tuple[str, float]] = {}
         # Inverse mapping: motion_joint -> (motor_joint, approximate_ratio)
         self.parallel_linkages_inverse: Dict[str, Tuple[str, float]] = {}
+        # Maps motor_joint -> [(rod_joint, ratio), ...] for passive rods
+        self.passive_rod_joints: Dict[str, List[Tuple[str, float]]] = {}
         
         self._discover_joint_couplings()  # Must discover couplings first to know which are drive joints
         self._discover_parallel_linkages()  # Discover parallel linkages before joint discovery
+        self._discover_passive_rod_joints()  # Discover passive rod joints (e.g., neck_pitch_front/back)
         self._discover_joints_and_actuators()
         self._discover_differential_drives()
         
@@ -609,6 +612,65 @@ class ViserKeyframeEditor:
             print(f"[Viser] Discovered {len(self.parallel_linkages)} parallel linkage mechanisms", flush=True)
             for motor, (motion, ratio) in self.parallel_linkages.items():
                 print(f"  {motor} -> {motion} (approx ratio: {ratio:.2f})", flush=True)
+
+    def _discover_passive_rod_joints(self) -> None:
+        """Discover passive rod joints for parallel linkage mechanisms.
+        
+        For mechanisms like neck_pitch_act:
+        - The motor joint controls linkage rods that push/pull the head
+        - The rod joints (neck_pitch_front, neck_pitch_back) are passive
+        - They rotate opposite to the motor: rod_angle ≈ -motor_angle
+        
+        This uses the naming convention from toddlerbot:
+        - Motor ends with '_act' (e.g., neck_pitch_act)
+        - Motion joint is base name (e.g., neck_pitch)
+        - Rod joints are base + '_front' and '_back' (e.g., neck_pitch_front, neck_pitch_back)
+        
+        When the motor moves, we set the rod joints to -motor_value for visual correctness.
+        """
+        # Maps motor_joint -> [(rod_joint, ratio), ...]
+        self.passive_rod_joints: Dict[str, List[Tuple[str, float]]] = {}
+        
+        # Find actuated joints (have motors)
+        actuated_joint_ids = set()
+        for act_id in range(self.model.nu):
+            trnid = self.model.actuator_trnid[act_id]
+            if trnid[0] >= 0:
+                actuated_joint_ids.add(trnid[0])
+        
+        # For each motor joint ending with '_act', find corresponding rod joints
+        for jnt_id in range(self.model.njnt):
+            if jnt_id not in actuated_joint_ids:
+                continue
+            
+            motor_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id)
+            if not motor_name:
+                continue
+            
+            # Check for parallel linkage pattern: motor ends with '_act'
+            if not motor_name.endswith('_act'):
+                continue
+            
+            # Base name without '_act' suffix
+            base_name = motor_name[:-4]  # Remove '_act'
+            
+            # Look for rod joints with naming pattern: base_front, base_back
+            rod_joints = []
+            for suffix in ['_front', '_back']:
+                rod_name = base_name + suffix
+                rod_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, rod_name)
+                if rod_id >= 0:
+                    # Rod rotates opposite to motor (approximation for parallel linkage)
+                    rod_joints.append((rod_name, -1.0))
+            
+            if rod_joints:
+                self.passive_rod_joints[motor_name] = rod_joints
+        
+        if self.passive_rod_joints:
+            print(f"[Viser] Discovered {len(self.passive_rod_joints)} motors with passive rod joints", flush=True)
+            for motor, rods in self.passive_rod_joints.items():
+                rod_names = [r[0] for r in rods]
+                print(f"  {motor} -> {rod_names}", flush=True)
 
     def _compute_mirror_signs(self) -> None:
         """Compute mirror signs based on joint axis orientations.
@@ -2172,6 +2234,18 @@ class ViserKeyframeEditor:
                     motor_value = motion_value / ratio
                     parallel_inverse_updates[motor_joint] = motor_value
         updates.update(parallel_inverse_updates)
+        
+        # Apply passive rod joint updates: when a motor joint moves,
+        # the passive rods must also rotate to maintain visual correctness.
+        # Uses the approximation: rod_angle ≈ -motor_angle (for typical parallel linkages)
+        passive_rod_updates: Dict[str, float] = {}
+        for motor_joint, motor_value in updates.items():
+            if motor_joint in self.passive_rod_joints:
+                for rod_joint, ratio in self.passive_rod_joints[motor_joint]:
+                    # ratio is typically -1.0 (rod rotates opposite to motor)
+                    rod_value = motor_value * ratio
+                    passive_rod_updates[rod_joint] = rod_value
+        updates.update(passive_rod_updates)
         
         self.worker.update_joint_angles(updates)
         return updates
