@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "robot-keyframe-kit"
-version = "0.1.1"
+version = "0.1.4"
 description = "A generalizable Viser-based keyframe editor for any MuJoCo robot"
 readme = "README.md"
 license = "MIT"

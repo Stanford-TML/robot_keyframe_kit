@@ -82,6 +82,7 @@ class SimWorker(threading.Thread):
         # Stepping state
         self.keyframe_test_counter = -1
         self.keyframe_test_dt = 0.0
+        self.keyframe_motor_target: Optional[np.ndarray] = None  # Target for PD control
 
         self.traj_test_counter = -1
         self.action_traj: Optional[List[np.ndarray]] = None
@@ -96,6 +97,107 @@ class SimWorker(threading.Thread):
         self.body_ang_vel_replay: List[np.ndarray] = []
         self.site_pos_replay: List[np.ndarray] = []
         self.site_quat_replay: List[np.ndarray] = []
+        
+        # Detect actuator types for proper control
+        # MuJoCo actuator types: motor (torque), position, velocity, etc.
+        # For motor-type actuators, we need to compute PD control ourselves
+        self.actuator_is_motor: List[bool] = []
+        self.actuator_joint_ids: List[int] = []
+        self._detect_actuator_types()
+
+    def _detect_actuator_types(self) -> None:
+        """Detect which actuators need manual PD control.
+        
+        MuJoCo actuator transmission types:
+        - mjTRN_JOINT (0): Direct joint actuation
+        - mjTRN_JOINTINPARENT (1): Joint in parent frame
+        - etc.
+        
+        MuJoCo actuator dynamic types:
+        - mjDYN_NONE (0): No dynamics (motor, general torque)
+        - mjDYN_INTEGRATOR (1): Integrator
+        - mjDYN_FILTER (2): Filter
+        - mjDYN_FILTEREXACT (3): Exact filter
+        - mjDYN_MUSCLE (4): Muscle model
+        
+        For actuators with dyntype=0 and gaintype=0 (typical <motor> elements),
+        ctrl directly sets torque. These need manual PD control.
+        
+        For actuators with gaintype=1 (position control, like <position kp="...">),
+        ctrl sets target position and MuJoCo handles the PD.
+        """
+        self.actuator_is_motor = []
+        self.actuator_joint_ids = []
+        
+        for act_id in range(self.model.nu):
+            # Get actuator properties
+            trntype = self.model.actuator_trntype[act_id]
+            dyntype = self.model.actuator_dyntype[act_id]
+            gaintype = self.model.actuator_gaintype[act_id]
+            
+            # Check if this actuator directly controls torque (motor type)
+            # Motor actuators have dyntype=0 and gaintype=0 (or fixed gain)
+            # Position actuators have gaintype=1 or gainprm[0] > 0 for proportional gain
+            is_motor = (dyntype == 0 and gaintype == 0)
+            
+            # Additional check: if gainprm[0] (kp) is large, it's likely position-controlled
+            kp = self.model.actuator_gainprm[act_id, 0]
+            if kp > 10:  # Position actuators typically have kp > 0
+                is_motor = False
+            
+            self.actuator_is_motor.append(is_motor)
+            
+            # Get the joint ID this actuator controls (for reading qpos/qvel)
+            trnid = self.model.actuator_trnid[act_id, 0]
+            self.actuator_joint_ids.append(trnid)
+        
+        # Log detection results
+        n_motor = sum(self.actuator_is_motor)
+        n_pos = len(self.actuator_is_motor) - n_motor
+        if n_motor > 0:
+            print(f"[SimWorker] Detected {n_motor} torque-controlled actuators (will use manual PD)", flush=True)
+        if n_pos > 0:
+            print(f"[SimWorker] Detected {n_pos} position-controlled actuators (using MuJoCo PD)", flush=True)
+
+    def _compute_pd_control(self, targets: np.ndarray, debug: bool = False) -> np.ndarray:
+        """Compute PD control for motor-type actuators.
+        
+        For position-controlled actuators, just pass through the target.
+        For motor/torque actuators, compute: torque = kp * (target - q) - kd * qvel
+        
+        Args:
+            targets: Target positions for all actuators.
+            debug: If True, print debug info for first motor.
+            
+        Returns:
+            Control signals (torques for motors, positions for position actuators).
+        """
+        ctrl = targets.copy()
+        
+        # Get PD gains from config
+        kp = getattr(self.config, 'kp', 12.0)
+        kd = getattr(self.config, 'kd', 0.5)
+        
+        for i, is_motor in enumerate(self.actuator_is_motor):
+            if is_motor:
+                # This is a motor actuator - compute PD torque
+                joint_id = self.actuator_joint_ids[i]
+                if joint_id >= 0:
+                    # Get joint's qpos index (accounting for free joints etc.)
+                    qpos_adr = self.model.jnt_qposadr[joint_id]
+                    qvel_adr = self.model.jnt_dofadr[joint_id]
+                    
+                    q = self.data.qpos[qpos_adr]
+                    qvel = self.data.qvel[qvel_adr]
+                    
+                    # PD control: torque = kp * (target - q) - kd * qvel
+                    error = targets[i] - q
+                    ctrl[i] = kp * error - kd * qvel
+                    
+                    if debug and i == 0:
+                        print(f"[PD] Motor 0: target={targets[i]:.4f}, q={q:.4f}, error={error:.4f}, torque={ctrl[i]:.4f}", flush=True)
+        
+        return ctrl
 
     # ----- Helper methods for raw MuJoCo -----
     def _get_body_transform(self, body_name: str) -> np.ndarray:
@@ -262,8 +364,57 @@ class SimWorker(threading.Thread):
         
         return ee_sites
 
+    def _get_lowest_geom_z(self) -> float:
+        """Find the lowest z-coordinate of any collision geometry in world frame.
+        
+        This accounts for geom positions, orientations, and sizes to find the
+        actual lowest point of the robot's collision geometry.
+        
+        Note: Mesh geoms are SKIPPED because their rbound (bounding sphere) 
+        massively overestimates the actual extent. Instead, we rely on 
+        primitive collision geoms (spheres, boxes, capsules) which are more
+        accurate for ground contact detection.
+        """
+        lowest_z = float("inf")
+        
+        for geom_id in range(self.model.ngeom):
+            # Get geom type and size
+            geom_type = self.model.geom_type[geom_id]
+            geom_size = self.model.geom_size[geom_id]
+            
+            # Get geom world position
+            geom_pos = self.data.geom_xpos[geom_id]
+            geom_z = geom_pos[2]
+            
+            # Estimate the lowest point based on geom type
+            # SKIP mesh geoms - their rbound is a bounding sphere which overestimates
+            # For humanoids/robots, the actual foot contact is usually defined by
+            # primitive geoms (spheres, boxes) not meshes
+            if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
+                radius = geom_size[0]
+                lowest_z = min(lowest_z, geom_z - radius)
+            elif geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
+                radius = geom_size[0]
+                half_length = geom_size[1]
+                # Capsule: worst case is when it's vertical
+                lowest_z = min(lowest_z, geom_z - radius - half_length)
+            elif geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
+                radius = geom_size[0]
+                half_length = geom_size[1]
+                lowest_z = min(lowest_z, geom_z - radius - half_length)
+            elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
+                # Box: half-sizes in size[0:3]
+                half_z = geom_size[2]
+                lowest_z = min(lowest_z, geom_z - half_z)
+            elif geom_type == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
+                half_z = geom_size[2]
+                lowest_z = min(lowest_z, geom_z - half_z)
+            # Skip MESH, PLANE, HFIELD - mesh rbound overestimates, plane/hfield are ground
+        
+        return lowest_z
+
     def request_on_ground(self):
-        """Place the robot on the ground by finding the lowest end-effector."""
+        """Place the robot on the ground by finding the lowest collision geometry."""
         with self.lock:
             if self.is_testing:
                 return
@@ -271,42 +422,49 @@ class SimWorker(threading.Thread):
             root_body = self.config.root_body
             torso_t_curr = self._get_body_transform(root_body)
             
-            # Find the lowest end-effector site
-            site_z_min = float("inf")
-            min_site = None
+            # Find the lowest z-coordinate of any collision geometry
+            # This is more accurate than just using site positions
+            lowest_z = self._get_lowest_geom_z()
             
-            # Use configured end-effector sites or auto-discover from leaf bodies
-            sites_to_check = self.config.end_effector_sites
-            if sites_to_check is None:
-                sites_to_check = self._discover_end_effector_sites()
-                if sites_to_check:
-                    print(f"[Ground] Auto-discovered EE sites from leaf bodies: {sites_to_check}", flush=True)
+            if lowest_z == float("inf"):
+                # Fallback to site-based detection
+                site_z_min = float("inf")
+                min_site = None
+                
+                sites_to_check = self.config.end_effector_sites
+                if sites_to_check is None:
+                    sites_to_check = self._discover_end_effector_sites()
+                    if sites_to_check:
+                        print(f"[Ground] Auto-discovered EE sites: {sites_to_check}", flush=True)
+                
+                for site_name in sites_to_check:
+                    try:
+                        curr_transform = self._get_site_transform(site_name)
+                        if curr_transform[2, 3] < site_z_min:
+                            site_z_min = curr_transform[2, 3]
+                            min_site = site_name
+                    except Exception:
+                        continue
+
+                if min_site is None:
+                    print("[Ground] No collision geometries or sites found", flush=True)
+                    return
+                
+                lowest_z = site_z_min
+                print(f"[Ground] Using site {min_site} at z={lowest_z:.4f}m", flush=True)
             
-            for site_name in sites_to_check:
-                try:
-                    curr_transform = self._get_site_transform(site_name)
-                    if curr_transform[2, 3] < site_z_min:
-                        site_z_min = curr_transform[2, 3]
-                        min_site = site_name
-                except Exception:
-                    continue  # Site doesn't exist
-
-            if min_site is None:
-                print("[Ground] No end-effector sites found", flush=True)
-                return
-
-            foot_t = self._get_site_transform(min_site)
-            aligned_torso_t = foot_t @ np.linalg.inv(foot_t) @ torso_t_curr
-            # Translate torso so the min foot touches z=0 plane (approx)
-            dz = foot_t[2, 3]
+            # Move the robot so the lowest point is at z=0
+            dz = lowest_z
+            aligned_torso_t = torso_t_curr.copy()
             aligned_torso_t[2, 3] -= dz
+            
             self.data.qpos[:3] = aligned_torso_t[:3, 3]
             self.data.qpos[3:7] = R.from_matrix(aligned_torso_t[:3, :3]).as_quat(
                 scalar_first=True
             )
             self._forward()
             print(
-                f"[Ground] Placed {min_site} on ground (moved down {dz:.3f}m)",
+                f"[Ground] Placed robot on ground (moved down {dz:.4f}m, lowest geom was at z={lowest_z:.4f}m)",
                 flush=True,
             )
 
@@ -324,8 +482,10 @@ class SimWorker(threading.Thread):
             self.keyframe_test_counter = -1
             self.traj_test_counter = -1
             self.data.qpos = keyframe.qpos.copy()
+            self.data.qvel[:] = 0
             self._forward()
-            self.data.ctrl[:] = keyframe.motor_pos.copy()
+            # Store motor target for PD control (don't set ctrl directly for motor actuators)
+            self.keyframe_motor_target = keyframe.motor_pos.copy()
             self.keyframe_test_dt = dt
             self.keyframe_test_counter = 0
             self.is_testing = True
@@ -415,8 +575,16 @@ class SimWorker(threading.Thread):
                     if self.keyframe_test_counter == 100:
                         self.keyframe_test_counter = -1
                         self.is_testing = False
+                        self.keyframe_motor_target = None
                     else:
-                        self._step()
+                        # Run n_frames physics substeps per control step
+                        n_substeps = getattr(self.config, 'n_frames', 10)
+                        for _ in range(n_substeps):
+                            # Compute PD control for motor actuators
+                            if self.keyframe_motor_target is not None:
+                                ctrl = self._compute_pd_control(self.keyframe_motor_target)
+                                self.data.ctrl[:] = ctrl
+                            self._step()
                         self.keyframe_test_counter += 1
                 time.sleep(self.keyframe_test_dt)
                 continue
@@ -506,25 +674,16 @@ class SimWorker(threading.Thread):
                     else:
                         target = self.action_traj[current_counter]
                         if self.traj_physics_enabled:
-                            # With physics enabled, use PD control for stiff joints
-                            # Get current joint positions and velocities
-                            current_pos = self._get_actuator_values_array()
-                            current_vel = np.zeros_like(current_pos)
-                            for i, act_name in enumerate(self.actuator_names):
-                                try:
-                                    jnt_id = self.model.actuator(act_name).trnid[0]
-                                    qvel_adr = self.model.jnt_dofadr[jnt_id]
-                                    current_vel[i] = self.data.qvel[qvel_adr]
-                                except Exception:
-                                    pass
-                            
-                            # PD control: torque = kp * (target - current) - kd * velocity
-                            kp = self.config.kp
-                            kd = self.config.kd
-                            pos_error = target - current_pos
-                            ctrl_signal = kp * pos_error - kd * current_vel
-                            self.data.ctrl[:] = ctrl_signal
-                            self._step()
+                            # With physics enabled, set control targets and step
+                            # Run n_frames physics substeps per control step (like original code)
+                            n_substeps = getattr(self.config, 'n_frames', 10)
+                            for substep in range(n_substeps):
+                                # For position-controlled actuators, ctrl is the target position
+                                # For motor/torque actuators, we compute PD control manually
+                                do_debug = (current_counter == 0 and substep == 0)
+                                ctrl = self._compute_pd_control(target, debug=do_debug)
+                                self.data.ctrl[:] = ctrl
+                                self._step()
                         else:
                             # Without physics, directly apply joint angles for visible motion
                             # Set actuator positions directly

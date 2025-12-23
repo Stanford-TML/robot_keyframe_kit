@@ -1,262 +1,237 @@
-# Robot Keyframe Kit
+# robot-keyframe-kit
 
-[![PyPI version](https://badge.fury.io/py/robot-keyframe-kit.svg)](https://pypi.org/project/robot-keyframe-kit/)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+A generalizable MuJoCo keyframe editor for creating and editing robot motion sequences. Works with any MuJoCo-compatible robot model.
 
-A web-based keyframe editor for **any MuJoCo robot**. Design robot motions through an intuitive 3D interface—no robot-specific code required.
+![](screenshot.png)
 
-https://github.com/user-attachments/assets/demo-video-placeholder
-
-## ✨ Features
-
-- **Universal Compatibility** — Works with any MuJoCo XML model out of the box
-- **Zero Configuration** — Auto-detects joints, actuators, end-effectors, and mirror pairs
-- **Web-Based Interface** — 3D visualization powered by [Viser](https://github.com/nerfstudio-project/viser)
-- **Mirror Mode** — Automatically synchronize left/right joint movements
-- **Physics Simulation** — Test keyframes with full MuJoCo physics
-- **Keyframe Sequencing** — Build timed motion sequences
-- **Trajectory Recording** — Record and export motion data
-- **YAML Configuration** — Optional per-robot config files for advanced customization
-
-## 🚀 Installation
+## Installation
 
 ```bash
 pip install robot-keyframe-kit
 ```
 
-Or install from source:
+## Quick Start
+
+### Using Scene XML (Recommended)
+
+For best results, use a `scene.xml` file that includes your robot model along with proper floor setup.
 
 ```bash
-git clone https://github.com/Stanford-TML/robot_keyframe_kit.git
-cd robot_keyframe_kit
-pip install -e .
+keyframe-editor /path/to/scene.xml --name my_robot
 ```
 
-## 📖 Quick Start
-
-### Command Line
+Most robot models from [mujoco_menagerie](https://github.com/google-deepmind/mujoco_menagerie) include a `scene.xml` file. For example:
 
 ```bash
-# Just provide your robot's MuJoCo XML file
-keyframe-editor path/to/robot.xml
-
-# With a custom name and save directory
-keyframe-editor path/to/robot.xml --name my_robot --save-dir ./keyframes
-
-# Using a YAML configuration file
-keyframe-editor path/to/robot.xml --config robot_config.yaml
-
-# Generate a config template for your robot
-keyframe-editor path/to/robot.xml --generate-config
+keyframe-editor /path/to/mujoco_menagerie/unitree_g1/scene.xml --name g1
 ```
 
-Then open **http://localhost:8081** in your browser.
+### Using Robot-Only XML
 
-### Python API
+If you only have a robot XML file (without scene setup), the editor will automatically:
 
-```python
-from robot_keyframe_kit import ViserKeyframeEditor, EditorConfig
+1. Detect that no floor plane exists
+2. Check for a `scene.xml` in the same directory and suggest using it
+3. Auto-generate a scene wrapper with floor plane for physics collision
 
-# Minimal usage — just provide the XML path
-editor = ViserKeyframeEditor("path/to/robot.xml")
-
-# With configuration
-config = EditorConfig(
-    name="my_robot",
-    root_body="base_link",
-    save_dir="my_keyframes",
-)
-editor = ViserKeyframeEditor("path/to/robot.xml", config=config)
-
-# Keep the server running
-import time
-while True:
-    time.sleep(1.0)
+```bash
+keyframe-editor /path/to/robot.xml --name my_robot
 ```
 
-### Loading from YAML Config
+**Note:** For better visualization and physics, create or use a proper `scene.xml`.
 
-```python
-from robot_keyframe_kit import ViserKeyframeEditor, EditorConfig
+### Creating a Scene XML
 
-# Load configuration from YAML
-config = EditorConfig.from_yaml("robot_config.yaml")
-editor = ViserKeyframeEditor("path/to/robot.xml", config=config)
+If your robot model doesn't have a `scene.xml`, you can create one:
+
+```xml
+<mujoco model="my_robot_scene">
+  <!-- Include your robot model -->
+  <include file="robot.xml"/>
+
+  <!-- Add floor and lighting -->
+  <asset>
+    <texture type="2d" name="groundplane" builtin="checker" 
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+             markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" 
+              texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 3.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" type="plane" size="10 10 0.05" material="groundplane"/>
+  </worldbody>
+</mujoco>
 ```
 
-## ⚙️ Configuration
+## Command-Line Options
 
-### YAML Configuration File
+```bash
+keyframe-editor <xml_path> [OPTIONS]
+```
 
-Create a `robot_config.yaml` for robot-specific settings:
+### Required Arguments
+
+- `xml_path`: Path to the MuJoCo XML file (scene.xml recommended, or robot.xml)
+
+### Optional Arguments
+
+- `--name <name>`: Name for this project (used in save filenames). Default: `robot`
+- `--root-body <body_name>`: Name of the root body for ground alignment. Auto-detected if not specified.
+- `--config <path>`: Path to YAML configuration file. Overrides auto-detection.
+- `--generate-config <path>`: Generate a YAML configuration file from the model and exit.
+- `--data <path>`: Path to load existing keyframe data from.
+- `--save-dir <dir>`: Directory to save keyframe data. Default: `keyframes`
+- `--no-auto-floor`: Disable automatic floor injection for robot-only XML files.
+
+## Configuration Files
+
+You can create a YAML configuration file to customize robot-specific settings:
 
 ```yaml
 name: my_robot
-root_body: torso
-
-# End-effector sites for pose tracking
-end_effectors:
-  - left_hand
-  - right_hand
+root_body: base_link
+end_effector_sites:
   - left_foot
   - right_foot
-
-# Joint mirror pairs (left: right)
 mirror_pairs:
-  left_shoulder: right_shoulder
-  left_elbow: right_elbow
-  left_hip: right_hip
+  left_hip_pitch: right_hip_pitch
   left_knee: right_knee
-
-# Mirror sign corrections (-1 to flip, 1 to keep same)
 mirror_signs:
-  left_shoulder: 1
-  left_elbow: -1
-  left_hip: 1
-  left_knee: 1
-
-# Output settings
+  left_hip_pitch: -1
+  left_knee: -1
+dt: 0.02
 save_dir: keyframes
+scene:
+  auto_inject_floor: true
+  show_floor: true
 ```
 
-### EditorConfig Options
+Generate a default config from your model:
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `name` | str | `"robot"` | Project name for saved files |
-| `root_body` | str | auto-detect | Body used for ground alignment |
-| `end_effector_sites` | list | auto-detect | Sites for end-effector tracking |
-| `mirror_pairs` | dict | auto-detect | Left-to-right joint mapping |
-| `mirror_signs` | dict | auto-detect | Sign corrections for mirroring |
-| `save_dir` | str | `"keyframes"` | Directory for saved keyframes |
-| `dt` | float | `0.02` | Trajectory timestep (50 Hz) |
-| `n_frames` | int | `20` | Physics substeps per control step |
-| `physics_dt` | float | `0.001` | Physics simulation timestep |
-| `show_com` | bool | `True` | Show center of mass marker |
-| `show_grid` | bool | `True` | Show ground grid |
+```bash
+keyframe-editor robot.xml --generate-config config.yaml
+```
 
-## 🎮 UI Guide
+## Features
 
-The editor interface has three main sections:
+- **Visual-Centric Joint Control**: Control motion joints intuitively
+- **Automatic Mechanism Detection**: Handles differential drives, gear couplings, and parallel linkages
+- **Mirror Mode**: Automatically mirrors joint movements with correct sign conventions
+- **Physics Simulation**: Test keyframes and trajectories with full MuJoCo physics
+- **Ground Placement**: Automatically places robot on ground based on lowest collision geometry
+- **End-Effector Tracking**: Auto-detects and tracks end-effector sites/bodies
 
-### Left Panel — Keyframe Controls
-- **Save Motion** — Export keyframes to compressed `.lz4` files
-- **Keyframe List** — Select, add, remove, and reorder keyframes
-- **Keyframe Operations** — Update, Test (with physics), Ground (place on floor)
-- **Sequence Builder** — Create timed motion sequences
 
-### Center Panel — Left-Side Joints
-- Joint sliders for left-side actuators
-- **End Effector Poses** — Save and restore end-effector positions
+## Python API
 
-### Right Panel — Right-Side Joints & Settings
-- Joint sliders for right-side actuators
-- **Mirror Mode** — Sync left/right movements
-- **Reverse Mirror** — Invert the mirror direction
-- **Physics Toggle** — Enable/disable simulation
-- **Visualization Options** — Grid, COM marker, etc.
-
-### Camera Controls
-- **Scroll** — Zoom in/out
-- **Left-click + Drag** — Rotate view
-- **Right-click + Drag** — Pan view
-
-## 📁 Output Format
-
-Keyframe data is saved as compressed `.lz4` files:
+You can also use the editor programmatically:
 
 ```python
-{
-    "keyframes": [
-        {
-            "name": "stand",
-            "motor_pos": [...],      # Actuator positions
-            "joint_pos": [...],      # Joint positions
-            "qpos": [...],           # Full MuJoCo qpos
-        },
-        ...
-    ],
-    "timed_sequence": [
-        ("stand", 0.0),
-        ("crouch", 0.5),
-        ("jump", 1.0),
-    ],
-    "time": [...],           # Trajectory timestamps
-    "qpos": [...],           # Full qpos trajectory
-    "body_pos": [...],       # Body positions over time
-    "body_quat": [...],      # Body orientations over time
-}
+from robot_keyframe_kit import ViserKeyframeEditor, EditorConfig
+
+# Load config from file
+config = EditorConfig.from_yaml("config.yaml")
+
+# Or create config programmatically
+config = EditorConfig(
+    name="my_robot",
+    root_body="base_link",
+    auto_inject_floor=True,
+    show_floor=True,
+)
+
+# Create editor
+editor = ViserKeyframeEditor(
+    "scene.xml",
+    config=config,
+)
+
+# Editor runs until interrupted
 ```
 
-### Loading Saved Keyframes
+## Save File Format
+
+Motion data is saved as LZ4-compressed pickle files (`.lz4`) using `joblib`. Files are saved to `{save_dir}/{name}/{motion_name}.lz4`.
+
+### Loading Save Files
 
 ```python
-import lz4.frame
-import pickle
+import joblib
 
-with lz4.frame.open("keyframes/my_robot/motion.lz4", "rb") as f:
-    data = pickle.load(f)
-
-print(data["keyframes"][0]["name"])  # First keyframe name
-print(data["timed_sequence"])        # Motion sequence
+data = joblib.load("keyframes/my_robot/walk.lz4")
 ```
 
-## 🤖 Tested Robots
+### File Structure
 
-Works with robots from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) and custom models:
+| Key | Type | Description |
+|-----|------|-------------|
+| `keyframes` | `List[dict]` | List of keyframe dictionaries (see below) |
+| `timed_sequence` | `List[Tuple[str, float]]` | Sequence of `(keyframe_name, duration_sec)` pairs |
+| `time` | `ndarray (T,)` | Timestamps for each trajectory frame |
+| `qpos` | `ndarray (T, nq)` | Full MuJoCo qpos at each frame |
+| `action` | `ndarray (T, nu)` or `None` | Motor commands (if action trajectory was played) |
+| `body_pos` | `ndarray (T, nbody, 3)` | Body positions (world or relative frame) |
+| `body_quat` | `ndarray (T, nbody, 4)` | Body orientations as quaternions (w, x, y, z) |
+| `body_lin_vel` | `ndarray (T, nbody, 3)` | Body linear velocities |
+| `body_ang_vel` | `ndarray (T, nbody, 3)` | Body angular velocities |
+| `site_pos` | `ndarray (T, n_sites, 3)` | End-effector site positions |
+| `site_quat` | `ndarray (T, n_sites, 4)` | End-effector site orientations |
+| `is_robot_relative_frame` | `bool` | Whether poses are in robot-relative frame |
 
-- **Humanoids** — Unitree G1, H1, ToddlerBot, OP3
-- **Quadrupeds** — Unitree A1, Go1, Boston Dynamics Spot
-- **Arms** — Franka Panda, UR5, xArm
-- **Hands** — Leap Hand, Shadow Hand
-- **Custom Models** — Any valid MuJoCo XML
+### Keyframe Dictionary Structure
 
-## 📋 Requirements
+Each keyframe in the `keyframes` list contains:
 
-- Python ≥ 3.9
-- MuJoCo ≥ 3.0
-- Modern web browser (Chrome, Firefox, Safari, Edge)
+| Key | Type | Description |
+|-----|------|-------------|
+| `name` | `str` | Human-readable keyframe name |
+| `motor_pos` | `ndarray (nu,)` | Motor/actuator positions |
+| `joint_pos` | `ndarray (nj,)` or `None` | Joint positions (may differ from motor_pos with transmissions) |
+| `qpos` | `ndarray (nq,)` or `None` | Full MuJoCo qpos including base pose |
 
-## 🛠️ Troubleshooting
+### Example Usage
 
-### Port Already in Use
-```bash
-# Use a different port
-keyframe-editor robot.xml --port 8082
+```python
+import joblib
+import numpy as np
+
+# Load motion data
+data = joblib.load("keyframes/toddlerbot/wave.lz4")
+
+# Get keyframes
+for kf in data["keyframes"]:
+    print(f"Keyframe: {kf['name']}, motor_pos shape: {kf['motor_pos'].shape}")
+
+# Get trajectory
+times = data["time"]  # (T,)
+qpos = data["qpos"]   # (T, nq)
+print(f"Trajectory: {len(times)} frames, {times[-1]:.2f}s duration")
+
+# Get timed sequence for playback
+for keyframe_name, duration in data["timed_sequence"]:
+    print(f"  {keyframe_name}: {duration}s")
 ```
 
-### Mirror Mode Not Working Correctly
-Generate a config file and manually adjust `mirror_signs`:
-```bash
-keyframe-editor robot.xml --generate-config
-# Edit the generated YAML, then:
-keyframe-editor robot.xml --config robot_config.yaml
-```
+## Troubleshooting
 
-### Robot Floating in Air
-The editor auto-detects `root_body` for grounding. If incorrect, specify it:
-```bash
-keyframe-editor robot.xml --root-body base_link
-```
+### Robot Falls Through Floor
 
-## 📄 License
+- **Check**: Does your XML have a floor plane? Use `scene.xml` if available.
+- **Solution**: The editor auto-injects a floor, but collision filtering may need adjustment.
+- **Best Fix**: Use a proper `scene.xml` with correct collision settings.
 
-MIT License — see [LICENSE](LICENSE) for details.
+### Slow Physics Simulation
 
-## 🤝 Contributing
+- **Check**: Model timestep settings (`model.opt.timestep`)
+- **Solution**: Editor uses `n_frames=20` substeps per control step for stability.
 
-Contributions welcome! Please open an issue or pull request on GitHub.
+### Wrong Joint Selection
 
-## 📚 Citation
+- **Check**: Are you seeing motor joints instead of motion joints?
+- **Solution**: The editor auto-detects differential drives and gear mechanisms. Check your config for manual overrides.
 
-If you use this tool in your research, please cite:
+## License
 
-```bibtex
-@software{robot_keyframe_kit,
-  title = {Robot Keyframe Kit},
-  author = {Stanford TML},
-  year = {2024},
-  url = {https://github.com/Stanford-TML/robot_keyframe_kit}
-}
-```
+MIT License

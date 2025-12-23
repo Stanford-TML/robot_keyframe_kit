@@ -79,9 +79,8 @@ class ViserKeyframeEditor:
         self.xml_path = os.path.abspath(xml_path)
         self.dt = config.dt
         
-        # Load MuJoCo model directly
-        self.model = mujoco.MjModel.from_xml_path(self.xml_path)
-        self.data = mujoco.MjData(self.model)
+        # Load MuJoCo model, ensuring it has a ground plane for physics
+        self.model, self.data = self._load_model_with_ground(self.xml_path)
         
         # Auto-detect root body if not specified
         if config.root_body is None:
@@ -770,6 +769,171 @@ class ViserKeyframeEditor:
             
             processed.add(joint_name)
             processed.add(partner)
+
+    def _load_model_with_ground(self, xml_path: str) -> Tuple[mujoco.MjModel, mujoco.MjData]:
+        """Load a MuJoCo model, ensuring it has a ground plane for physics simulation.
+        
+        If the model doesn't have a floor/plane geom in worldbody, one is added
+        automatically so that physics simulation works correctly. Also checks for
+        scene.xml in the same directory and suggests using it if available.
+        
+        Args:
+            xml_path: Path to the MuJoCo XML file.
+            
+        Returns:
+            Tuple of (MjModel, MjData).
+        """
+        import tempfile
+        
+        # First, load the model normally to check if it has a ground plane
+        model = mujoco.MjModel.from_xml_path(xml_path)
+        
+        # Check if there's a plane geom in the model (for floor)
+        has_ground = False
+        for geom_id in range(model.ngeom):
+            if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_PLANE:
+                has_ground = True
+                break
+        
+        if has_ground:
+            # Model already has a ground plane, use it as-is
+            data = mujoco.MjData(model)
+            return model, data
+        
+        # Model doesn't have a ground plane - check for scene.xml nearby
+        xml_dir = os.path.dirname(xml_path)
+        xml_basename = os.path.basename(xml_path)
+        scene_xml = os.path.join(xml_dir, "scene.xml")
+        
+        if os.path.exists(scene_xml) and xml_basename != "scene.xml":
+            print(
+                f"[Viser] Model has no ground plane. Hint: Consider using '{scene_xml}' "
+                f"which includes floor, lighting, and proper scene setup.",
+                flush=True,
+            )
+        else:
+            print(
+                "[Viser] Model has no ground plane. Consider creating a scene.xml that includes "
+                "your robot with a floor plane for better visualization and physics.",
+                flush=True,
+            )
+        
+        # Check if auto-injection is enabled
+        if not getattr(self.config, 'auto_inject_floor', True):
+            print("[Viser] Auto floor injection disabled. Loading model as-is.", flush=True)
+            data = mujoco.MjData(model)
+            return model, data
+        
+        # Model doesn't have a ground plane - inject one with enhanced scene
+        print("[Viser] Auto-generating scene wrapper with floor and lighting...", flush=True)
+        
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+            
+            # Check if this is a scene file (has worldbody with content) or robot-only
+            worldbody = root.find("worldbody")
+            is_robot_only = worldbody is None or len(worldbody) == 0
+            
+            if worldbody is None:
+                worldbody = ET.SubElement(root, "worldbody")
+            
+            # Add lighting if not present
+            if worldbody.find("light") is None:
+                light = ET.Element("light")
+                light.set("pos", "0 0 3.5")
+                light.set("dir", "0 0 -1")
+                light.set("directional", "true")
+                worldbody.insert(0, light)
+            
+            # Add visual settings if not present
+            visual = root.find("visual")
+            if visual is None:
+                visual = ET.SubElement(root, "visual")
+                headlight = ET.SubElement(visual, "headlight")
+                headlight.set("diffuse", "0.6 0.6 0.6")
+                headlight.set("ambient", "0.1 0.1 0.1")
+                headlight.set("specular", "0.9 0.9 0.9")
+            
+            # Add asset section for floor material if not present
+            asset = root.find("asset")
+            if asset is None:
+                asset = ET.SubElement(root, "asset")
+            
+            # Add floor texture and material if not present
+            if asset.find(".//texture[@name='groundplane']") is None:
+                texture = ET.SubElement(asset, "texture")
+                texture.set("type", "2d")
+                texture.set("name", "groundplane")
+                texture.set("builtin", "checker")
+                texture.set("rgb1", "0.2 0.3 0.4")
+                texture.set("rgb2", "0.1 0.2 0.3")
+                texture.set("markrgb", "0.8 0.8 0.8")
+                texture.set("width", "300")
+                texture.set("height", "300")
+                
+                material = ET.SubElement(asset, "material")
+                material.set("name", "groundplane")
+                material.set("texture", "groundplane")
+                material.set("texuniform", "true")
+                material.set("texrepeat", "5 5")
+                material.set("reflectance", "0.2")
+            
+            # Add a floor plane geom at the beginning of worldbody
+            # Check if floor already exists
+            existing_floor = worldbody.find(".//geom[@name='_keyframe_editor_floor']")
+            if existing_floor is not None:
+                worldbody.remove(existing_floor)
+            
+            floor_geom = ET.Element("geom")
+            floor_geom.set("name", "_keyframe_editor_floor")
+            floor_geom.set("type", "plane")
+            floor_geom.set("size", "10 10 0.05")  # Large floor plane
+            floor_geom.set("contype", "1")  # Collision type
+            floor_geom.set("conaffinity", "1")  # Collision affinity
+            
+            # Make floor visible or invisible based on config
+            show_floor = getattr(self.config, 'show_floor', True)
+            if show_floor:
+                floor_geom.set("material", "groundplane")
+            else:
+                floor_geom.set("rgba", "0.5 0.5 0.5 0")  # Invisible (alpha=0)
+            
+            # Insert at beginning of worldbody (after light if present)
+            if worldbody.find("light") is not None:
+                # Insert after light
+                light_idx = list(worldbody).index(worldbody.find("light"))
+                worldbody.insert(light_idx + 1, floor_geom)
+            else:
+                worldbody.insert(0, floor_geom)
+            
+            # Write to a temp file in the same directory (so relative asset paths work)
+            with tempfile.NamedTemporaryFile(
+                mode='w', 
+                suffix='.xml', 
+                dir=xml_dir, 
+                delete=False
+            ) as tmp_file:
+                tree.write(tmp_file.name, encoding='unicode')
+                tmp_path = tmp_file.name
+            
+            try:
+                model = mujoco.MjModel.from_xml_path(tmp_path)
+            finally:
+                # Clean up temp file
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            # If injection fails, use original model
+            print(f"[Viser] Warning: Could not inject ground plane: {e}", flush=True)
+            print("[Viser] Loading original model (physics may not work correctly)", flush=True)
+            model = mujoco.MjModel.from_xml_path(xml_path)
+        
+        data = mujoco.MjData(model)
+        return model, data
 
     def _auto_detect_root_body(self) -> str:
         """Auto-detect the root body as the first non-world body that is a direct child of world.
@@ -2531,6 +2695,11 @@ def main() -> None:
         default=None,
         help="Generate a YAML configuration file from the model and exit. Path where to save the config.",
     )
+    parser.add_argument(
+        "--no-auto-floor",
+        action="store_true",
+        help="Disable automatic floor injection for robot-only XML files. Use scene.xml instead for best results.",
+    )
     args = parser.parse_args()
 
     # Handle config generation
@@ -2559,6 +2728,10 @@ def main() -> None:
             root_body=args.root_body,
             save_dir=args.save_dir,
         )
+    
+    # Apply CLI flags
+    if args.no_auto_floor:
+        config.auto_inject_floor = False
 
     editor = ViserKeyframeEditor(
         args.xml_path,

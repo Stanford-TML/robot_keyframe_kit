@@ -41,14 +41,20 @@ class EditorConfig:
     n_frames: int = 20  # Number of physics substeps per control step
     physics_dt: float = 0.001  # Physics timestep
     
-    # PD control gains for trajectory playback
-    # Higher values = stiffer joints. Adjust based on robot's actuator setup.
-    kp: float = 50.0  # Position gain (proportional)
-    kd: float = 2.0   # Velocity gain (derivative)
+    # PD control gains for trajectory playback (for motor/torque actuators)
+    # These are used when actuators are motor-type (not position-type).
+    # Toddlerbot uses kp_sim = 10-14 (after kp_ratio division from config values 1500-2100)
+    # Note: Position-type actuators (like Unitree G1) use MuJoCo's built-in PD.
+    kp: float = 12.0  # Position gain (proportional) - matches typical Dynamixel motors
+    kd: float = 0.5   # Velocity gain (derivative) - light damping
     
     # UI settings
     show_com: bool = True  # Show center of mass marker
     show_grid: bool = True  # Show ground grid
+    
+    # Scene generation settings
+    auto_inject_floor: bool = True  # Whether to auto-inject floor for robot-only XMLs
+    show_floor: bool = True  # Whether the injected floor should be visible
     
     @classmethod
     def from_yaml(cls, path: str) -> "EditorConfig":
@@ -83,7 +89,7 @@ class EditorConfig:
         mapped_data = {}
         
         # Direct mappings
-        for key in ["name", "root_body", "dt", "save_dir", "kp", "kd", "n_frames", "physics_dt", "show_com", "show_grid"]:
+        for key in ["name", "root_body", "dt", "save_dir", "kp", "kd", "n_frames", "physics_dt", "show_com", "show_grid", "auto_inject_floor", "show_floor"]:
             if key in data:
                 mapped_data[key] = data[key]
         
@@ -146,6 +152,10 @@ class EditorConfig:
             "ui": {
                 "show_com": self.show_com,
                 "show_grid": self.show_grid,
+            },
+            "scene": {
+                "auto_inject_floor": self.auto_inject_floor,
+                "show_floor": self.show_floor,
             },
         }
         
