@@ -46,13 +46,15 @@ class SimWorker(threading.Thread):
         on_traj: Optional[
             Callable[
                 [
-                    List[np.ndarray],
-                    List[np.ndarray],
-                    List[np.ndarray],
-                    List[np.ndarray],
-                    List[np.ndarray],
-                    List[np.ndarray],
-                    List[np.ndarray],
+                    List[np.ndarray],  # qpos_replay
+                    List[np.ndarray],  # motor_vel_replay
+                    List[np.ndarray],  # joint_vel_replay
+                    List[np.ndarray],  # body_pos_replay
+                    List[np.ndarray],  # body_quat_replay
+                    List[np.ndarray],  # body_lin_vel_replay
+                    List[np.ndarray],  # body_ang_vel_replay
+                    List[np.ndarray],  # site_pos_replay
+                    List[np.ndarray],  # site_quat_replay
                 ],
                 None,
             ]
@@ -91,6 +93,8 @@ class SimWorker(threading.Thread):
 
         # Replay buffers
         self.qpos_replay: List[np.ndarray] = []
+        self.motor_vel_replay: List[np.ndarray] = []
+        self.joint_vel_replay: List[np.ndarray] = []
         self.body_pos_replay: List[np.ndarray] = []
         self.body_quat_replay: List[np.ndarray] = []
         self.body_lin_vel_replay: List[np.ndarray] = []
@@ -104,6 +108,15 @@ class SimWorker(threading.Thread):
         self.actuator_is_motor: List[bool] = []
         self.actuator_joint_ids: List[int] = []
         self._detect_actuator_types()
+        
+        # Index tracking for velocity extraction (matching toddlerbot approach)
+        # motor_indices: indices of actuator-controlled joints in qpos/qvel
+        # joint_indices: indices of UI-visible joints in qpos/qvel
+        self.motor_indices: np.ndarray = np.array([], dtype=np.int32)
+        self.joint_indices: np.ndarray = np.array([], dtype=np.int32)
+        self.q_start_idx: int = 0   # Offset for qpos (7 if floating base, 0 if fixed)
+        self.qd_start_idx: int = 0  # Offset for qvel (6 if floating base, 0 if fixed)
+        self._compute_velocity_indices()
 
     def _detect_actuator_types(self) -> None:
         """Detect which actuators need manual PD control.
@@ -158,6 +171,55 @@ class SimWorker(threading.Thread):
             print(f"[SimWorker] Detected {n_motor} torque-controlled actuators (will use manual PD)", flush=True)
         if n_pos > 0:
             print(f"[SimWorker] Detected {n_pos} position-controlled actuators (using MuJoCo PD)", flush=True)
+
+    def _compute_velocity_indices(self) -> None:
+        """Compute indices for extracting motor and joint velocities from qvel.
+        
+        This follows the toddlerbot approach:
+        - motor_indices: indices of actuator-controlled joints
+        - joint_indices: indices of UI-visible joints (joint_names)
+        - q_start_idx: offset in qpos (7 for floating base, 0 for fixed)
+        - qd_start_idx: offset in qvel (6 for floating base, 0 for fixed)
+        """
+        # Determine if robot has a floating base (free joint)
+        has_free_joint = False
+        for jnt_id in range(self.model.njnt):
+            if self.model.jnt_type[jnt_id] == mujoco.mjtJoint.mjJNT_FREE:
+                has_free_joint = True
+                break
+        
+        if has_free_joint:
+            self.q_start_idx = 7   # Skip [x,y,z,qw,qx,qy,qz]
+            self.qd_start_idx = 6  # Skip [vx,vy,vz,wx,wy,wz]
+        else:
+            self.q_start_idx = 0
+            self.qd_start_idx = 0
+        
+        # Motor indices: from actuator_joint_ids (indices of actuated joints)
+        # Need to convert joint IDs to qvel indices (relative to qd_start_idx)
+        motor_idx_list = []
+        for joint_id in self.actuator_joint_ids:
+            if joint_id >= 0:
+                # jnt_dofadr gives the index in qvel for this joint
+                dof_adr = self.model.jnt_dofadr[joint_id]
+                # Subtract qd_start_idx to get relative index
+                rel_idx = dof_adr - self.qd_start_idx
+                if rel_idx >= 0:
+                    motor_idx_list.append(rel_idx)
+        self.motor_indices = np.array(motor_idx_list, dtype=np.int32)
+        
+        # Joint indices: from joint_names (UI-visible joints)
+        joint_idx_list = []
+        for joint_name in self.joint_names:
+            joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+            if joint_id >= 0:
+                dof_adr = self.model.jnt_dofadr[joint_id]
+                rel_idx = dof_adr - self.qd_start_idx
+                if rel_idx >= 0:
+                    joint_idx_list.append(rel_idx)
+        self.joint_indices = np.array(joint_idx_list, dtype=np.int32)
+        
+        print(f"[SimWorker] Velocity indices: {len(self.motor_indices)} motors, {len(self.joint_indices)} joints", flush=True)
 
     def _compute_pd_control(self, targets: np.ndarray, debug: bool = False) -> np.ndarray:
         """Compute PD control for motor-type actuators.
@@ -533,6 +595,8 @@ class SimWorker(threading.Thread):
 
             # Clear replay
             self.qpos_replay.clear()
+            self.motor_vel_replay.clear()
+            self.joint_vel_replay.clear()
             self.body_pos_replay.clear()
             self.body_quat_replay.clear()
             self.body_lin_vel_replay.clear()
@@ -609,6 +673,8 @@ class SimWorker(threading.Thread):
                     if self.on_traj:
                         self.on_traj(
                             self.qpos_replay.copy(),
+                            self.motor_vel_replay.copy(),
+                            self.joint_vel_replay.copy(),
                             self.body_pos_replay.copy(),
                             self.body_quat_replay.copy(),
                             self.body_lin_vel_replay.copy(),
@@ -621,6 +687,8 @@ class SimWorker(threading.Thread):
                         self.keyframe_test_counter = -1
                         self.action_traj = None
                         self.qpos_replay.clear()
+                        self.motor_vel_replay.clear()
+                        self.joint_vel_replay.clear()
                         self.body_pos_replay.clear()
                         self.body_quat_replay.clear()
                         self.body_lin_vel_replay.clear()
@@ -642,6 +710,8 @@ class SimWorker(threading.Thread):
                     if self.on_traj:
                         self.on_traj(
                             self.qpos_replay.copy(),
+                            self.motor_vel_replay.copy(),
+                            self.joint_vel_replay.copy(),
                             self.body_pos_replay.copy(),
                             self.body_quat_replay.copy(),
                             self.body_lin_vel_replay.copy(),
@@ -655,6 +725,8 @@ class SimWorker(threading.Thread):
                         self.action_traj = None
                         self.is_testing = False
                         self.qpos_replay.clear()
+                        self.motor_vel_replay.clear()
+                        self.joint_vel_replay.clear()
                         self.body_pos_replay.clear()
                         self.body_quat_replay.clear()
                         self.body_lin_vel_replay.clear()
@@ -692,6 +764,42 @@ class SimWorker(threading.Thread):
 
                     # Record
                     qpos_data = self.data.qpos.copy()
+                    
+                    # Compute motor and joint velocities
+                    # For qpos trajectory (no physics): use mj_differentiatePos
+                    # For action trajectory with physics: use qvel directly
+                    if self.is_qpos_traj and current_counter < len(self.action_traj) - 1:
+                        # Qpos trajectory: compute qvel from consecutive frames
+                        current_qpos = self.action_traj[current_counter]
+                        next_qpos = self.action_traj[current_counter + 1]
+                        qvel_computed = np.zeros(self.model.nv, dtype=np.float64)
+                        mujoco.mj_differentiatePos(
+                            self.model,
+                            qvel_computed,
+                            self.traj_test_dt,
+                            current_qpos,
+                            next_qpos,
+                        )
+                        # Extract motor and joint velocities from computed qvel
+                        if len(self.motor_indices) > 0:
+                            motor_vel_data = qvel_computed[self.qd_start_idx + self.motor_indices].astype(np.float32)
+                        else:
+                            motor_vel_data = np.array([], dtype=np.float32)
+                        if len(self.joint_indices) > 0:
+                            joint_vel_data = qvel_computed[self.qd_start_idx + self.joint_indices].astype(np.float32)
+                        else:
+                            joint_vel_data = np.array([], dtype=np.float32)
+                    else:
+                        # Action trajectory or last frame: use qvel from simulation
+                        if len(self.motor_indices) > 0:
+                            motor_vel_data = self.data.qvel[self.qd_start_idx + self.motor_indices].astype(np.float32)
+                        else:
+                            motor_vel_data = np.array([], dtype=np.float32)
+                        if len(self.joint_indices) > 0:
+                            joint_vel_data = self.data.qvel[self.qd_start_idx + self.joint_indices].astype(np.float32)
+                        else:
+                            joint_vel_data = np.array([], dtype=np.float32)
+                    
                     root_body = self.config.root_body
                     torso_rot = R.from_quat(
                         self.data.body(root_body).xquat.copy(), scalar_first=True
@@ -768,6 +876,8 @@ class SimWorker(threading.Thread):
 
                 # Append outside of lock
                 self.qpos_replay.append(qpos_data)
+                self.motor_vel_replay.append(motor_vel_data)
+                self.joint_vel_replay.append(joint_vel_data)
                 self.body_pos_replay.append(body_pos)
                 self.body_quat_replay.append(body_quat)
                 self.body_lin_vel_replay.append(body_lin_vel)

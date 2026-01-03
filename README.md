@@ -171,6 +171,8 @@ data = joblib.load("keyframes/my_robot/walk.lz4")
 | `timed_sequence` | `List[Tuple[str, float]]` | Sequence of `(keyframe_name, duration_sec)` pairs |
 | `time` | `ndarray (T,)` | Timestamps for each trajectory frame |
 | `qpos` | `ndarray (T, nq)` | Full MuJoCo qpos at each frame |
+| `motor_vel` | `ndarray (T, n_motors)` | Motor/actuator joint velocities (rad/s) |
+| `joint_vel` | `ndarray (T, n_joints)` | UI-visible joint velocities (rad/s) |
 | `action` | `ndarray (T, nu)` or `None` | Motor commands (if action trajectory was played) |
 | `body_pos` | `ndarray (T, nbody, 3)` | Body positions (world or relative frame) |
 | `body_quat` | `ndarray (T, nbody, 4)` | Body orientations as quaternions (w, x, y, z) |

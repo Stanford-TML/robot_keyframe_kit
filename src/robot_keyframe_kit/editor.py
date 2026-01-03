@@ -142,6 +142,8 @@ class ViserKeyframeEditor:
         self.is_qpos_traj = False
         self.is_relative_frame = True
         self.qpos_replay: List[np.ndarray] = []
+        self.motor_vel_replay: List[np.ndarray] = []
+        self.joint_vel_replay: List[np.ndarray] = []
         self.body_pos_replay: List[np.ndarray] = []
         self.body_quat_replay: List[np.ndarray] = []
         self.body_lin_vel_replay: List[np.ndarray] = []
@@ -166,6 +168,7 @@ class ViserKeyframeEditor:
         self.slider_widgets: Dict[str, viser.GuiSliderHandle] = {}
         self.collision_geom_checked: Optional[viser.GuiCheckboxHandle] = None
         self.show_all_geoms: Optional[viser.GuiCheckboxHandle] = None
+        self.show_com_checked: Optional[viser.GuiCheckboxHandle] = None
         self.motion_name_input: Optional[viser.GuiTextHandle] = None
         self.keyframes_summary: Optional[viser.GuiHtmlHandle] = None
         self.keyframe_index_input: Optional[viser.GuiTextHandle] = None
@@ -1904,6 +1907,8 @@ class ViserKeyframeEditor:
 
             result_dict["time"] = np.array(self.traj_times)
             result_dict["qpos"] = np.array(self.qpos_replay)
+            result_dict["motor_vel"] = np.array(self.motor_vel_replay)
+            result_dict["joint_vel"] = np.array(self.joint_vel_replay)
             result_dict["body_pos"] = np.array(self.body_pos_replay)
             result_dict["body_quat"] = np.array(self.body_quat_replay)
             result_dict["body_lin_vel"] = np.array(self.body_lin_vel_replay)
@@ -2019,6 +2024,9 @@ class ViserKeyframeEditor:
             self.traj_times = list(map(float, data.get("time", [])))
             self.action_traj = data.get("action", [])
             self.qpos_replay = list(data.get("qpos", []))
+            # Load velocity data (backward compatible - empty list if not present)
+            self.motor_vel_replay = list(data.get("motor_vel", []))
+            self.joint_vel_replay = list(data.get("joint_vel", []))
             self._refresh_keyframes_table()
             self._refresh_sequence_table()
             print(f"[Load] ✅ Loaded {len(self.keyframes)} keyframes, {len(self.sequence_list)} sequence entries", flush=True)
@@ -2434,6 +2442,8 @@ class ViserKeyframeEditor:
     def _on_traj(
         self,
         qpos_replay: List[np.ndarray],
+        motor_vel_replay: List[np.ndarray],
+        joint_vel_replay: List[np.ndarray],
         body_pos_replay: List[np.ndarray],
         body_quat_replay: List[np.ndarray],
         body_lin_vel_replay: List[np.ndarray],
@@ -2442,6 +2452,8 @@ class ViserKeyframeEditor:
         site_quat_replay: List[np.ndarray],
     ) -> None:
         self.qpos_replay = qpos_replay
+        self.motor_vel_replay = motor_vel_replay
+        self.joint_vel_replay = joint_vel_replay
         self.body_pos_replay = body_pos_replay
         self.body_quat_replay = body_quat_replay
         self.body_lin_vel_replay = body_lin_vel_replay
@@ -2612,6 +2624,10 @@ class ViserKeyframeEditor:
                 "Show All Geoms",
                 False,
             )
+            self.show_com_checked = self.server.gui.add_checkbox(
+                "Show Center of Mass",
+                self.config.show_com,  # Default from config
+            )
 
         @self.mirror_checked.on_update
         def _(ev: GuiEvent) -> None:
@@ -2634,6 +2650,39 @@ class ViserKeyframeEditor:
         @self.show_all_geoms.on_update
         def _(_event: GuiEvent) -> None:
             self._apply_geom_visibility()
+
+        @self.show_com_checked.on_update
+        def _(_event: GuiEvent) -> None:
+            self._apply_com_visibility()
+
+    def _apply_com_visibility(self) -> None:
+        """Toggle visibility of the center of mass sphere."""
+        show_com = (
+            bool(self.show_com_checked.value)
+            if self.show_com_checked
+            else self.config.show_com
+        )
+        
+        if show_com:
+            # Create COM sphere if it doesn't exist
+            if self._com_sphere is None:
+                try:
+                    self._com_sphere = self.server.scene.add_icosphere(
+                        "/robot/com",
+                        radius=0.03,
+                        position=(0.0, 0.0, 0.0),
+                        color=(1.0, 0.0, 0.0),
+                    )
+                except Exception as exc:
+                    print(f"[Viser] Failed to add CoM sphere: {exc}", flush=True)
+        else:
+            # Remove COM sphere if it exists
+            if self._com_sphere is not None:
+                try:
+                    self._com_sphere.remove()
+                except Exception:
+                    pass
+                self._com_sphere = None
 
     def _base_keyframe_name(self, name: str) -> str:
         parts = name.rsplit("_", 1)
