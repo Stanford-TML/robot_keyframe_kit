@@ -6,9 +6,9 @@ A generalizable MuJoCo keyframe editor for creating and editing robot motion seq
 ![](screenshot_unitree.png)
 
 # Video Tutorial and Demo
-## Tutorial: https://youtu.be/ZoRK3STKsd0
+**Tutorial: https://youtu.be/ZoRK3STKsd0**
 
-## Demo: https://youtu.be/a2tvW3x8Luk
+**Demo: https://youtu.be/a2tvW3x8Luk**
 
 ## Installation
 
