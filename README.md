@@ -2,13 +2,14 @@
 
 A generalizable MuJoCo keyframe editor for creating and editing robot motion sequences. Works with any MuJoCo-compatible robot model.
 
-![](screenshot.png)
-![](screenshot_unitree.png)
+![](demo.gif)
 
-# Video Tutorial and Demo
-**Tutorial: https://youtu.be/ZoRK3STKsd0**
+## 🎬 Video Tutorial
 
-**Demo: https://youtu.be/a2tvW3x8Luk**
+[![Watch the Tutorial](screenshot_unitree.png)](https://www.youtube.com/watch?v=ZoRK3STKsd0)
+
+**▶️ [Click to watch the full tutorial on YouTube](https://www.youtube.com/watch?v=ZoRK3STKsd0)**
+
 
 ## Installation
 
