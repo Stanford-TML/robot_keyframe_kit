@@ -216,6 +216,7 @@ keyframes/
 # Build artifacts
 dist/
 build/
+demo.mp4
 
 # Keep examples in git (but exclude from PyPI package)
-# examples/
+# examples/demo.mp4
