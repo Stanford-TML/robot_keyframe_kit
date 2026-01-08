@@ -241,6 +241,34 @@ for keyframe_name, duration in data["timed_sequence"]:
 - **Check**: Are you seeing motor joints instead of motion joints?
 - **Solution**: The editor auto-detects differential drives and gear mechanisms. Check your config for manual overrides.
 
+## Citation
+
+If you find this tool useful for your research, please consider citing:
+
+```bibtex
+@misc{yang2026locomotion,
+  title = {Locomotion {{Beyond Feet}}},
+  author = {Yang, Tae Hoon and Shi, Haochen and Hu, Jiacheng and Zhang, Zhicong and Jiang, Daniel and Wang, Weizhuo and He, Yao and Wu, Zhen and Chen, Yuming and Hou, Yifan and Kennedy, Monroe and Song, Shuran and Liu, C. Karen},
+  year = 2026,
+  month = jan,
+  number = {arXiv:2601.03607},
+  eprint = {2601.03607},
+  primaryclass = {cs},
+  publisher = {arXiv},
+  doi = {10.48550/arXiv.2601.03607},
+  urldate = {2026-01-08},
+  archiveprefix = {arXiv},
+  keywords = {Computer Science - Robotics}
+}
+
+@article{shi2025toddlerbot,
+  title={ToddlerBot: Open-Source ML-Compatible Humanoid Platform for Loco-Manipulation},
+  author={Shi, Haochen and Wang, Weizhuo and Song, Shuran and Liu, C. Karen},
+  journal={arXiv preprint arXiv:2502.00893},
+  year={2025}
+}
+```
+
 ## License
 
 MIT License
