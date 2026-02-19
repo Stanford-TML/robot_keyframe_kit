@@ -17,6 +17,36 @@ A generalizable MuJoCo keyframe editor for creating and editing robot motion seq
 pip install robot-keyframe-kit
 ```
 
+## Development Setup (Conda)
+
+For contributors, use an editable install so local code changes are reflected immediately.
+
+```bash
+git clone https://github.com/Stanford-TML/robot_keyframe_kit.git
+cd robot_keyframe_kit
+
+conda create -n robot_keyframe_kit python=3.10 -y
+conda activate robot_keyframe_kit
+
+python -m pip install -e ".[dev]"
+
+# Optional: download MuJoCo Menagerie assets for local testing/examples
+bash scripts/setup_assets.sh
+```
+
+Verify the editable install and CLI entrypoint:
+
+```bash
+python -c "import robot_keyframe_kit; print(robot_keyframe_kit.__file__)"
+keyframe-editor --help
+```
+
+Optional example (after running `bash scripts/setup_assets.sh`):
+
+```bash
+keyframe-editor assets/mujoco_menagerie/toddlerbot_2xc/scene.xml --name toddlerbot_2xc
+```
+
 ## Quick Start
 
 ### Using Scene XML (Recommended)

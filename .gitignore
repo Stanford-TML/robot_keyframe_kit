@@ -212,6 +212,7 @@ MUJOCO_LOG.TXT
 PLAN.md
 examples/
 keyframes/
+assets/mujoco_menagerie/
 
 # Build artifacts
 dist/
