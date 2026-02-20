@@ -39,6 +39,15 @@ try:
 except ImportError:
     trimesh = None
 
+try:
+    import mink
+except Exception as exc:
+    raise ImportError(
+        "mink is required for IK in robot-keyframe-kit.\n"
+        "Install with: pip install mink==0.0.13\n"
+        f"Original import error: {exc}"
+    ) from exc
+
 from .config import EditorConfig
 from .keyframe import Keyframe
 from .math_utils import interpolate_action
@@ -51,7 +60,7 @@ class ViserKeyframeEditor:
     This class provides a web-based keyframe editor that works directly with
     MuJoCo XML files. Joint names, actuator names, and limits are automatically
     discovered from the model.
-    
+
     Example:
         >>> from robot_keyframe_kit import ViserKeyframeEditor, EditorConfig
         >>> editor = ViserKeyframeEditor("path/to/robot.xml")
@@ -66,7 +75,7 @@ class ViserKeyframeEditor:
         data_path: str = "",
     ) -> None:
         """Initialize the keyframe editor.
-        
+
         Args:
             xml_path: Path to the MuJoCo XML scene file.
             config: Optional configuration object. Uses defaults if not provided.
@@ -74,70 +83,78 @@ class ViserKeyframeEditor:
         """
         if config is None:
             config = EditorConfig()
-        
+
         self.config = config
         self.xml_path = os.path.abspath(xml_path)
         self.dt = config.dt
-        
+
         # Load MuJoCo model, ensuring it has a ground plane for physics
         self.model, self.data = self._load_model_with_ground(self.xml_path)
-        
+
         # Auto-detect root body if not specified
         if config.root_body is None:
             config.root_body = self._auto_detect_root_body()
             print(f"[Viser] Auto-detected root body: {config.root_body}", flush=True)
-        
+
         # Auto-discover joints and actuators from model
         self.joint_names: List[str] = []
         self.actuator_names: List[str] = []
         self.joint_limits: Dict[str, Tuple[float, float]] = {}
         self.default_positions: Dict[str, float] = {}
-        
+
         # Maps motion joint -> tendon info for inverse computation
         # Structure: motion_joint -> (tendon_name, [(motor_joint, motor_coef), ...], motion_coef)
-        self.differential_drives: Dict[str, Tuple[str, List[Tuple[str, float]], float]] = {}
-        
+        self.differential_drives: Dict[
+            str, Tuple[str, List[Tuple[str, float]], float]
+        ] = {}
+
         # Initialize coupling dictionaries
         self.joint_couplings: Dict[str, Tuple[str, float, float]] = {}
         self.joint_couplings_inverse: Dict[str, Tuple[str, float, float]] = {}
-        
+
         # Maps motor_joint -> (motion_joint, approximate_ratio) for parallel linkages
         self.parallel_linkages: Dict[str, Tuple[str, float]] = {}
         # Inverse mapping: motion_joint -> (motor_joint, approximate_ratio)
         self.parallel_linkages_inverse: Dict[str, Tuple[str, float]] = {}
         # Maps motor_joint -> [(rod_joint, ratio), ...] for passive rods
         self.passive_rod_joints: Dict[str, List[Tuple[str, float]]] = {}
-        
+
         # Floating base detection and root pose sliders
         self.has_floating_base = self._has_floating_base()
         self.root_slider_widgets: Dict[str, viser.GuiSliderHandle] = {}
+        self.root_pose_gizmo: Optional[object] = None
+        self._updating_root_gizmo: bool = False
         if self.has_floating_base:
-            print("[Viser] Detected floating base (freejoint) - root pose controls will be available", flush=True)
-        
+            print(
+                "[Viser] Detected floating base (freejoint) - root pose controls will be available",
+                flush=True,
+            )
+
         self._discover_joint_couplings()  # Must discover couplings first to know which are drive joints
         self._discover_parallel_linkages()  # Discover parallel linkages before joint discovery
         self._discover_passive_rod_joints()  # Discover passive rod joints (e.g., neck_pitch_front/back)
         self._discover_joints_and_actuators()
         self._discover_differential_drives()
-        
-        # Try to get home pose from model keyframe or use qpos0
-        try:
-            self.home_qpos = np.array(
-                self.model.keyframe("home").qpos, dtype=np.float32
-            )
-        except (KeyError, Exception):
-            self.home_qpos = self.model.qpos0.copy()
-        
+
+        # Resolve a startup "home" pose: prefer named keyframe, then first keyframe, then qpos0.
+        self.home_qpos = self._resolve_home_qpos()
+        # Important: initialize simulation state from home pose before starting worker.
+        self.data.qpos[:] = self.home_qpos.copy()
+        self.data.qvel[:] = 0
+        mujoco.mj_forward(self.model, self.data)
+
         # Set up save directory: {save_dir}/{name}/
         # Files will be saved as {motion_name}_{timestamp}.lz4
         self.result_dir = os.path.join(config.save_dir, config.name)
         os.makedirs(self.result_dir, exist_ok=True)
         self.data_path = data_path
-        
+
         # Mirror configuration - can be customized via config, then auto-computed
-        self.mirror_joint_signs = config.mirror_signs.copy() if config.mirror_signs else {}
+        self.mirror_joint_signs = (
+            config.mirror_signs.copy() if config.mirror_signs else {}
+        )
         self._compute_mirror_signs()  # Auto-compute based on joint axis orientations
-        
+
         # State
         self.keyframes: List[Keyframe] = []
         self.sequence_list: List[Tuple[str, float]] = []
@@ -158,6 +175,17 @@ class ViserKeyframeEditor:
         self.site_quat_replay: List[np.ndarray] = []
 
         self.saved_ee_poses: Dict[str, np.ndarray] = {}
+        self.ee_target_handles: Dict[str, object] = {}
+        self.ee_target_positions: Dict[str, np.ndarray] = {}
+        self.ee_target_orientations: Dict[str, np.ndarray] = {}
+        self.ee_target_slider_widgets: Dict[str, Dict[str, viser.GuiSliderHandle]] = {}
+        self.ee_target_slider_folders: Dict[str, object] = {}
+        self.ik_targets_toggle_button: Optional[viser.GuiButtonHandle] = None
+        self.ik_targets_status: Optional[viser.GuiMarkdownHandle] = None
+        self._updating_ik_target_handles: set[str] = set()
+        self._ik_target_sites: List[str] = []
+        self._last_live_ik_time: float = 0.0
+        self._ik_orientation_cost = 0.4
 
         # Scene bookkeeping
         self._geom_handles: Dict[int, object] = {}
@@ -186,9 +214,15 @@ class ViserKeyframeEditor:
         self.rev_mirror_checked: Optional[viser.GuiCheckboxHandle] = None
         self.physics_enabled: Optional[viser.GuiCheckboxHandle] = None
         self.relative_frame_checked: Optional[viser.GuiCheckboxHandle] = None
+        self.root_pose_gizmo_checked: Optional[viser.GuiCheckboxHandle] = None
 
         self._updating_handles: set[int] = set()
         self.normalized_range = (-2000.0, 2000.0)
+
+        self._mink_configuration = None
+        self._mink_posture_task = None
+        self._mink_limits = None
+        self._mink_root_lock_warned = False
 
         # Lock shared between geometry updates and worker callbacks
         self.worker_lock = threading.Lock()
@@ -198,11 +232,11 @@ class ViserKeyframeEditor:
         try:
             self.server.gui.configure_theme(
                 control_layout="fixed",
-                control_width="large",
+                control_width="small",
             )
         except Exception as exc:
             print(f"[Viser] configure_theme failed: {exc}", flush=True)
-        
+
         if config.show_grid:
             self.server.scene.add_grid("/grid", width=20, height=20, infinite_grid=True)
 
@@ -220,6 +254,25 @@ class ViserKeyframeEditor:
                     client.camera.vertical_fov = 55.0
             except Exception:
                 pass
+
+        if hasattr(self.server, "on_key_event"):
+
+            @self.server.on_key_event
+            def _(event) -> None:
+                if getattr(event, "event_type", "") != "keydown":
+                    return
+                if bool(getattr(event, "repeat", False)):
+                    return
+                key = str(getattr(event, "key", "")).lower()
+                if (
+                    key == "r"
+                    and self.has_floating_base
+                    and self.root_pose_gizmo_checked is not None
+                ):
+                    self._toggle_root_gizmo_checkbox()
+                    return
+                if key == "t":
+                    self._toggle_ik_targets()
 
         try:
             mujoco.mj_forward(self.model, self.data)
@@ -289,7 +342,7 @@ class ViserKeyframeEditor:
 
         self._start_scene_updater()
         data_loaded = self._load_data()
-        
+
         # Auto-ground only if no data was loaded (fresh start)
         # When loading saved data, keep the saved positions
         if not data_loaded:
@@ -299,12 +352,79 @@ class ViserKeyframeEditor:
 
     # -- Floating Base Detection and Helpers --
 
+    def _resolve_home_qpos(self) -> np.ndarray:
+        """Resolve initial qpos from model keyframes, falling back to qpos0."""
+        # 1) Prefer explicitly named keyframe "home" if available.
+        try:
+            q_home = np.array(self.model.keyframe("home").qpos, dtype=np.float32)
+            if q_home.shape[0] == self.model.nq:
+                print(
+                    "[Viser] Using model keyframe 'home' as startup pose.", flush=True
+                )
+                return q_home
+        except Exception:
+            pass
+
+        # 2) Fall back to first keyframe if present.
+        if self.model.nkey > 0:
+            try:
+                key_qpos = np.array(self.model.key_qpos, dtype=np.float32).reshape(
+                    self.model.nkey, self.model.nq
+                )
+                q0 = key_qpos[0].copy()
+                key0_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_KEY, 0)
+                if key0_name:
+                    print(
+                        f"[Viser] Using first model keyframe '{key0_name}' as startup pose.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[Viser] Using first model keyframe as startup pose.",
+                        flush=True,
+                    )
+                return q0
+            except Exception:
+                pass
+
+        # 3) Final fallback to qpos0.
+        print("[Viser] Using model qpos0 as startup pose.", flush=True)
+        return np.array(self.model.qpos0, dtype=np.float32).copy()
+
+    def _get_motor_pos_from_qpos(self, qpos: np.ndarray) -> np.ndarray:
+        """Compute actuator-space targets from a given qpos."""
+        if self.model.nu <= 0:
+            return np.zeros(0, dtype=np.float32)
+        if not self.actuator_names:
+            return np.zeros(self.model.nu, dtype=np.float32)
+
+        qpos_arr = np.asarray(qpos, dtype=np.float64)
+        with self.worker_lock:
+            prev_qpos = self.data.qpos.copy()
+            prev_qvel = self.data.qvel.copy()
+            try:
+                self.data.qpos[:] = qpos_arr
+                self.data.qvel[:] = 0
+                mujoco.mj_forward(self.model, self.data)
+                motor_pos = np.array(
+                    [
+                        self.data.actuator(name).length.item()
+                        for name in self.actuator_names
+                    ],
+                    dtype=np.float32,
+                )
+            finally:
+                self.data.qpos[:] = prev_qpos
+                self.data.qvel[:] = prev_qvel
+                mujoco.mj_forward(self.model, self.data)
+        return motor_pos
+
     def _has_floating_base(self) -> bool:
         """Check if robot has a floating base (freejoint on root body).
-        
+
         A floating base means the robot's root body has a freejoint, giving it
         6 DoF (3 translation + 3 rotation) stored in qpos[0:7].
-        
+
         Returns:
             True if the model has a freejoint on the root body, False otherwise.
         """
@@ -317,36 +437,36 @@ class ViserKeyframeEditor:
 
     def _euler_to_quat(self, roll: float, pitch: float, yaw: float) -> np.ndarray:
         """Convert Euler angles (radians) to quaternion (w, x, y, z) for MuJoCo.
-        
+
         Args:
             roll: Rotation around X axis in radians
-            pitch: Rotation around Y axis in radians  
+            pitch: Rotation around Y axis in radians
             yaw: Rotation around Z axis in radians
-            
+
         Returns:
             Quaternion as [w, x, y, z] (MuJoCo convention)
         """
-        rot = R.from_euler('xyz', [roll, pitch, yaw], degrees=False)
+        rot = R.from_euler("xyz", [roll, pitch, yaw], degrees=False)
         quat_xyzw = rot.as_quat()  # scipy returns [x, y, z, w]
         return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
 
     def _quat_to_euler(self, quat_wxyz: np.ndarray) -> Tuple[float, float, float]:
         """Convert quaternion (w, x, y, z) to Euler angles (radians).
-        
+
         Args:
             quat_wxyz: Quaternion as [w, x, y, z] (MuJoCo convention)
-            
+
         Returns:
             Tuple of (roll, pitch, yaw) in radians
         """
         quat_xyzw = [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
         rot = R.from_quat(quat_xyzw)
-        euler = rot.as_euler('xyz', degrees=False)
+        euler = rot.as_euler("xyz", degrees=False)
         return (float(euler[0]), float(euler[1]), float(euler[2]))
 
     def _discover_joints_and_actuators(self) -> None:
         """Auto-discover joints and actuators from the MuJoCo model.
-        
+
         Only discovers actuated joints (joints that have motors attached).
         This prevents creating sliders for passive joints in closed-loop mechanisms
         that cannot be controlled independently.
@@ -357,35 +477,45 @@ class ViserKeyframeEditor:
             trnid = self.model.actuator_trnid[i]
             if trnid[0] >= 0:
                 actuated_joint_ids.add(trnid[0])
-        
+
         # Track which motor joints are part of differential drives (to be replaced)
         motor_joints_in_differential = set()
-        
+
         # First pass: discover differential drives to identify motor joints to replace
         for tendon_id in range(self.model.ntendon):
             adr = self.model.tendon_adr[tendon_id]
             num = self.model.tendon_num[tendon_id]
-            
+
             joints_in_tendon = []
             for i in range(num):
                 wrap_idx = adr + i
                 obj_id = self.model.wrap_objid[wrap_idx]
                 coef = float(self.model.wrap_prm[wrap_idx])
-                joint_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id)
+                joint_name = mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id
+                )
                 if joint_name:
                     joints_in_tendon.append((joint_name, coef, obj_id))
-            
+
             if len(joints_in_tendon) < 2:
                 continue
-            
-            motor_joints = [(n, c, jid) for n, c, jid in joints_in_tendon if jid in actuated_joint_ids]
-            motion_joints = [(n, c, jid) for n, c, jid in joints_in_tendon if jid not in actuated_joint_ids]
-            
+
+            motor_joints = [
+                (n, c, jid)
+                for n, c, jid in joints_in_tendon
+                if jid in actuated_joint_ids
+            ]
+            motion_joints = [
+                (n, c, jid)
+                for n, c, jid in joints_in_tendon
+                if jid not in actuated_joint_ids
+            ]
+
             # Differential drive: multiple motors -> single motion
             if len(motor_joints) >= 2 and len(motion_joints) == 1:
                 for motor_name, _, motor_jid in motor_joints:
                     motor_joints_in_differential.add(motor_name)
-        
+
         # Discover joints: use motion joints for differential drives, motor joints otherwise
         for i in range(self.model.njnt):
             name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, i)
@@ -395,20 +525,20 @@ class ViserKeyframeEditor:
             # Skip free joints (type 0)
             if jnt_type == 0:
                 continue
-            
+
             # For differential drives: skip motor joints, add motion joints instead
             if name in motor_joints_in_differential:
                 continue  # Skip motor joint, will add motion joint below
-            
+
             # For gear mechanisms: skip drive joints, will add driven joints below
             # Check if this is a drive joint that has a driven partner
             if name in self.joint_couplings:
                 continue  # Skip drive joint, will add driven joint below
-            
+
             # For parallel linkages: skip motor joints, will add motion joints below
             if name in self.parallel_linkages:
                 continue  # Skip motor joint
-            
+
             # Add actuated joints (motors) that are not drive joints
             if i in actuated_joint_ids:
                 self.joint_names.append(name)
@@ -422,24 +552,34 @@ class ViserKeyframeEditor:
                 # Get default position from qpos0
                 qpos_adr = self.model.jnt_qposadr[i]
                 self.default_positions[name] = float(self.model.qpos0[qpos_adr])
-        
+
         # Second pass: add motion joints for differential drives
         for tendon_id in range(self.model.ntendon):
             adr = self.model.tendon_adr[tendon_id]
             num = self.model.tendon_num[tendon_id]
-            
+
             joints_in_tendon = []
             for i in range(num):
                 wrap_idx = adr + i
                 obj_id = self.model.wrap_objid[wrap_idx]
                 coef = float(self.model.wrap_prm[wrap_idx])
-                joint_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id)
+                joint_name = mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id
+                )
                 if joint_name:
                     joints_in_tendon.append((joint_name, coef, obj_id))
-            
-            motor_joints = [(n, c, jid) for n, c, jid in joints_in_tendon if jid in actuated_joint_ids]
-            motion_joints = [(n, c, jid) for n, c, jid in joints_in_tendon if jid not in actuated_joint_ids]
-            
+
+            motor_joints = [
+                (n, c, jid)
+                for n, c, jid in joints_in_tendon
+                if jid in actuated_joint_ids
+            ]
+            motion_joints = [
+                (n, c, jid)
+                for n, c, jid in joints_in_tendon
+                if jid not in actuated_joint_ids
+            ]
+
             # Add motion joints for differential drives
             if len(motor_joints) >= 2 and len(motion_joints) == 1:
                 motion_name, motion_coef, motion_jid = motion_joints[0]
@@ -454,12 +594,20 @@ class ViserKeyframeEditor:
                         self.joint_limits[motion_name] = (-3.14159, 3.14159)
                     # Get default position
                     qpos_adr = self.model.jnt_qposadr[motion_jid]
-                    self.default_positions[motion_name] = float(self.model.qpos0[qpos_adr])
-        
+                    self.default_positions[motion_name] = float(
+                        self.model.qpos0[qpos_adr]
+                    )
+
         # Third pass: add driven joints for gear mechanisms (replace drive joints)
-        for driven_name, (drive_name, offset, ratio) in self.joint_couplings_inverse.items():
+        for driven_name, (
+            drive_name,
+            offset,
+            ratio,
+        ) in self.joint_couplings_inverse.items():
             if driven_name not in self.joint_names:
-                driven_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, driven_name)
+                driven_id = mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_JOINT, driven_name
+                )
                 if driven_id >= 0:
                     self.joint_names.append(driven_name)
                     # Get joint limits from the driven joint
@@ -471,12 +619,16 @@ class ViserKeyframeEditor:
                         self.joint_limits[driven_name] = (-3.14159, 3.14159)
                     # Get default position
                     qpos_adr = self.model.jnt_qposadr[driven_id]
-                    self.default_positions[driven_name] = float(self.model.qpos0[qpos_adr])
-        
+                    self.default_positions[driven_name] = float(
+                        self.model.qpos0[qpos_adr]
+                    )
+
         # Fourth pass: add motion joints for parallel linkages (replace motor joints)
         for motion_name, (motor_name, ratio) in self.parallel_linkages_inverse.items():
             if motion_name not in self.joint_names:
-                motion_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, motion_name)
+                motion_id = mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_JOINT, motion_name
+                )
                 if motion_id >= 0:
                     self.joint_names.append(motion_name)
                     # Get joint limits from the motion joint
@@ -488,64 +640,80 @@ class ViserKeyframeEditor:
                         self.joint_limits[motion_name] = (-3.14159, 3.14159)
                     # Get default position
                     qpos_adr = self.model.jnt_qposadr[motion_id]
-                    self.default_positions[motion_name] = float(self.model.qpos0[qpos_adr])
-        
+                    self.default_positions[motion_name] = float(
+                        self.model.qpos0[qpos_adr]
+                    )
+
         # Discover actuators
         for i in range(self.model.nu):
             name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
             if name:
                 self.actuator_names.append(name)
-        
-        print(f"[Viser] Discovered {len(self.joint_names)} actuated joints, {len(self.actuator_names)} actuators", flush=True)
+
+        print(
+            f"[Viser] Discovered {len(self.joint_names)} actuated joints, {len(self.actuator_names)} actuators",
+            flush=True,
+        )
 
     def _discover_joint_couplings(self) -> None:
         """Discover joint equality constraints (gear couplings) from the model.
-        
+
         For robots with gear mechanisms, moving a 'drive' joint should also move
         its coupled 'driven' joint according to the gear ratio. This method builds
         a mapping from drive joints to their driven joints with the gear ratio.
-        
+
         The constraint is: driven = polycoef[0] + polycoef[1] * drive
         """
         # Maps drive_joint -> (driven_joint, offset, ratio) for forward computation
         # Maps driven_joint -> (drive_joint, offset, ratio) for inverse computation
         self.joint_couplings: Dict[str, Tuple[str, float, float]] = {}
         self.joint_couplings_inverse: Dict[str, Tuple[str, float, float]] = {}
-        
+
         for eq_id in range(self.model.neq):
             if self.model.eq_type[eq_id] == mujoco.mjtEq.mjEQ_JOINT:
                 # For JOINT constraints, obj1id is the driven joint, obj2id is the drive joint
                 driven_id = self.model.eq_obj1id[eq_id]
                 drive_id = self.model.eq_obj2id[eq_id]
-                
+
                 if drive_id < 0:
                     continue
-                
-                driven_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, driven_id)
-                drive_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, drive_id)
-                
+
+                driven_name = mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_JOINT, driven_id
+                )
+                drive_name = mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_JOINT, drive_id
+                )
+
                 if driven_name and drive_name:
                     # eq_data: [polycoef[0], polycoef[1], ...] where driven = polycoef[0] + polycoef[1] * drive
                     eq_data = self.model.eq_data[eq_id]
                     offset = float(eq_data[0])
                     ratio = float(eq_data[1])
-                    
+
                     # Forward: drive -> driven
                     self.joint_couplings[drive_name] = (driven_name, offset, ratio)
                     # Inverse: driven -> drive (drive = (driven - offset) / ratio)
                     if abs(ratio) > 1e-6:  # Avoid division by zero
-                        self.joint_couplings_inverse[driven_name] = (drive_name, offset, ratio)
-        
+                        self.joint_couplings_inverse[driven_name] = (
+                            drive_name,
+                            offset,
+                            ratio,
+                        )
+
         if self.joint_couplings:
-            print(f"[Viser] Discovered {len(self.joint_couplings)} joint couplings (gear constraints)", flush=True)
+            print(
+                f"[Viser] Discovered {len(self.joint_couplings)} joint couplings (gear constraints)",
+                flush=True,
+            )
 
     def _discover_differential_drives(self) -> None:
         """Discover differential drive mechanisms (tendon couplings).
-        
+
         For differential drives like the waist mechanism:
         - Multiple motor joints (waist_act_1, waist_act_2) control
         - Single motion DOF (waist_yaw, waist_roll)
-        
+
         This method identifies these patterns and stores the inverse mapping
         so users can control the intuitive motion joints instead of motor joints.
         """
@@ -555,16 +723,18 @@ class ViserKeyframeEditor:
             trnid = self.model.actuator_trnid[i]
             if trnid[0] >= 0:
                 actuated_joint_ids.add(trnid[0])
-        
+
         # Analyze each tendon to find differential drives
         for tendon_id in range(self.model.ntendon):
-            tendon_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id)
+            tendon_name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id
+            )
             if tendon_name is None:
                 continue
-            
+
             adr = self.model.tendon_adr[tendon_id]
             num = self.model.tendon_num[tendon_id]
-            
+
             # Collect all joints in this tendon with their coefficients
             joints_in_tendon = []
             for i in range(num):
@@ -572,44 +742,53 @@ class ViserKeyframeEditor:
                 wrap_type = self.model.wrap_type[wrap_idx]
                 obj_id = self.model.wrap_objid[wrap_idx]
                 coef = float(self.model.wrap_prm[wrap_idx])
-                
+
                 # For fixed tendons, obj_id refers to joint ID (even if wrap_type is pulley)
                 joint_id = obj_id
-                joint_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
-                
+                joint_name = mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_id
+                )
+
                 if joint_name:
                     joints_in_tendon.append((joint_name, coef, joint_id))
-            
+
             if len(joints_in_tendon) < 2:
                 continue
-            
+
             # Separate into actuated (motor) and passive (motion) joints
             motor_joints = []
             motion_joints = []
-            
+
             for joint_name, coef, joint_id in joints_in_tendon:
                 if joint_id in actuated_joint_ids:
                     motor_joints.append((joint_name, coef))
                 else:
                     motion_joints.append((joint_name, coef))
-            
+
             # If we have multiple motors controlling a single motion DOF, it's a differential drive
             if len(motor_joints) >= 2 and len(motion_joints) == 1:
                 motion_joint, motion_coef = motion_joints[0]
                 motor_list = [(mname, mcoef) for mname, mcoef in motor_joints]
-                self.differential_drives[motion_joint] = (tendon_name, motor_list, motion_coef)
-        
+                self.differential_drives[motion_joint] = (
+                    tendon_name,
+                    motor_list,
+                    motion_coef,
+                )
+
         if self.differential_drives:
-            print(f"[Viser] Discovered {len(self.differential_drives)} differential drive motion joints", flush=True)
+            print(
+                f"[Viser] Discovered {len(self.differential_drives)} differential drive motion joints",
+                flush=True,
+            )
 
     def _discover_parallel_linkages(self) -> None:
         """Discover parallel linkage mechanisms.
-        
+
         For mechanisms like neck_pitch:
         - motor joint (neck_pitch_act) is on a child body (neck_pitch_plate)
         - passive joint (neck_pitch) is on the parent body (head)
         - CONNECT constraints create a closed loop
-        
+
         We want to show the passive joint (intuitive) instead of the motor joint.
         """
         # Find actuated joints
@@ -618,129 +797,147 @@ class ViserKeyframeEditor:
             trnid = self.model.actuator_trnid[act_id]
             if trnid[0] >= 0:
                 actuated_joint_ids.add(trnid[0])
-        
+
         # Check for CONNECT constraints (indicate closed-loop mechanisms)
         has_connect = any(
             self.model.eq_type[eq_id] == mujoco.mjtEq.mjEQ_CONNECT
             for eq_id in range(self.model.neq)
         )
-        
+
         if not has_connect:
             return
-        
+
         # Maps motor_joint -> (motion_joint, approximate_ratio)
         self.parallel_linkages: Dict[str, Tuple[str, float]] = {}
-        
+
         # For each actuated joint, check if its body's parent has a passive joint
         for jnt_id in range(self.model.njnt):
             if jnt_id not in actuated_joint_ids:
                 continue
-            
-            motor_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id)
+
+            motor_name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id
+            )
             motor_body_id = self.model.jnt_bodyid[jnt_id]
             parent_body_id = self.model.body_parentid[motor_body_id]
-            
+
             if parent_body_id <= 0:  # Skip if parent is world
                 continue
-            
+
             # Find passive joints on the parent body
             for other_jnt_id in range(self.model.njnt):
                 if other_jnt_id in actuated_joint_ids:
                     continue
                 if self.model.jnt_bodyid[other_jnt_id] != parent_body_id:
                     continue
-                
-                motion_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, other_jnt_id)
-                
+
+                motion_name = mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_JOINT, other_jnt_id
+                )
+
                 # Check if they have similar names (e.g., neck_pitch_act and neck_pitch)
                 # Motor name should contain motion name or vice versa
-                motor_base = motor_name.replace('_act', '').replace('_drive', '').replace('_motor', '')
+                motor_base = (
+                    motor_name.replace("_act", "")
+                    .replace("_drive", "")
+                    .replace("_motor", "")
+                )
                 motion_base = motion_name
-                
+
                 if motor_base == motion_base or motion_base in motor_name:
                     # Found a parallel linkage pair!
                     # Approximate ratio: typically close to -1.0 for parallel linkages
                     self.parallel_linkages[motor_name] = (motion_name, -1.0)
                     self.parallel_linkages_inverse[motion_name] = (motor_name, -1.0)
-        
+
         if self.parallel_linkages:
-            print(f"[Viser] Discovered {len(self.parallel_linkages)} parallel linkage mechanisms", flush=True)
+            print(
+                f"[Viser] Discovered {len(self.parallel_linkages)} parallel linkage mechanisms",
+                flush=True,
+            )
             for motor, (motion, ratio) in self.parallel_linkages.items():
                 print(f"  {motor} -> {motion} (approx ratio: {ratio:.2f})", flush=True)
 
     def _discover_passive_rod_joints(self) -> None:
         """Discover passive rod joints for parallel linkage mechanisms.
-        
+
         For mechanisms like neck_pitch_act:
         - The motor joint controls linkage rods that push/pull the head
         - The rod joints (neck_pitch_front, neck_pitch_back) are passive
         - They rotate opposite to the motor: rod_angle ≈ -motor_angle
-        
+
         This uses the naming convention from toddlerbot:
         - Motor ends with '_act' (e.g., neck_pitch_act)
         - Motion joint is base name (e.g., neck_pitch)
         - Rod joints are base + '_front' and '_back' (e.g., neck_pitch_front, neck_pitch_back)
-        
+
         When the motor moves, we set the rod joints to -motor_value for visual correctness.
         """
         # Maps motor_joint -> [(rod_joint, ratio), ...]
         self.passive_rod_joints: Dict[str, List[Tuple[str, float]]] = {}
-        
+
         # Find actuated joints (have motors)
         actuated_joint_ids = set()
         for act_id in range(self.model.nu):
             trnid = self.model.actuator_trnid[act_id]
             if trnid[0] >= 0:
                 actuated_joint_ids.add(trnid[0])
-        
+
         # For each motor joint ending with '_act', find corresponding rod joints
         for jnt_id in range(self.model.njnt):
             if jnt_id not in actuated_joint_ids:
                 continue
-            
-            motor_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id)
+
+            motor_name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id
+            )
             if not motor_name:
                 continue
-            
+
             # Check for parallel linkage pattern: motor ends with '_act'
-            if not motor_name.endswith('_act'):
+            if not motor_name.endswith("_act"):
                 continue
-            
+
             # Base name without '_act' suffix
             base_name = motor_name[:-4]  # Remove '_act'
-            
+
             # Look for rod joints with naming pattern: base_front, base_back
             rod_joints = []
-            for suffix in ['_front', '_back']:
+            for suffix in ["_front", "_back"]:
                 rod_name = base_name + suffix
-                rod_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, rod_name)
+                rod_id = mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_JOINT, rod_name
+                )
                 if rod_id >= 0:
                     # Rod rotates opposite to motor (approximation for parallel linkage)
                     rod_joints.append((rod_name, -1.0))
-            
+
             if rod_joints:
                 self.passive_rod_joints[motor_name] = rod_joints
-        
+
         if self.passive_rod_joints:
-            print(f"[Viser] Discovered {len(self.passive_rod_joints)} motors with passive rod joints", flush=True)
+            print(
+                f"[Viser] Discovered {len(self.passive_rod_joints)} motors with passive rod joints",
+                flush=True,
+            )
             for motor, rods in self.passive_rod_joints.items():
                 rod_names = [r[0] for r in rods]
                 print(f"  {motor} -> {rod_names}", flush=True)
 
     def _compute_mirror_signs(self) -> None:
         """Compute mirror signs based on joint axis orientations.
-        
+
         For geometric mirroring across the sagittal (left-right) plane:
-        
+
         The Y-axis is perpendicular to the sagittal plane, so Y-axis rotations
         produce symmetric motion with the SAME angle values.
-        
+
         X and Z axes are parallel to the sagittal plane, so rotations around
         them require OPPOSITE angles for visual mirror symmetry.
-        
+
         Additionally, if left/right axes point in opposite directions, the
         axis flip already accounts for part of the mirroring.
-        
+
         Rules:
         - Same axes, Y-axis: sign = +1 (same angles for mirror)
         - Same axes, X/Z-axis: sign = -1 (opposite angles for mirror)
@@ -757,12 +954,12 @@ class ViserKeyframeEditor:
             ("Left", "Right"),
             ("L_", "R_"),
         ]
-        
+
         processed = set()
         for joint_name in self.joint_names:
             if joint_name in processed:
                 continue
-            
+
             # Find partner
             partner = None
             for left_pat, right_pat in patterns:
@@ -776,30 +973,34 @@ class ViserKeyframeEditor:
                     if candidate in self.joint_names and candidate != joint_name:
                         partner = candidate
                         break
-            
+
             if partner is None:
                 continue
-            
+
             # Get joint IDs
-            jnt_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-            partner_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, partner)
-            
+            jnt_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
+            )
+            partner_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, partner
+            )
+
             if jnt_id < 0 or partner_id < 0:
                 continue
-            
+
             # Get axes
             axis1 = self.model.jnt_axis[jnt_id]
             axis2 = self.model.jnt_axis[partner_id]
-            
+
             # Check if axes are same or opposite direction
             dot = float(np.dot(axis1, axis2))
             axes_same_direction = dot > 0.5
-            
+
             # Determine primary axis type (X, Y, or Z)
             abs_axis = np.abs(axis1)
             is_x_axis = abs_axis[0] > 0.5
             is_y_axis = abs_axis[1] > 0.5
-            
+
             # Compute mirror sign based on axis type and direction relationship
             if axes_same_direction:
                 if is_y_axis:
@@ -816,51 +1017,53 @@ class ViserKeyframeEditor:
                 else:
                     # Y/Z-axis: still need opposite angles
                     mirror_sign = -1.0
-            
+
             # Only override if not already specified in config
             if joint_name not in self.mirror_joint_signs:
                 self.mirror_joint_signs[joint_name] = mirror_sign
             if partner not in self.mirror_joint_signs:
                 self.mirror_joint_signs[partner] = mirror_sign
-            
+
             processed.add(joint_name)
             processed.add(partner)
 
-    def _load_model_with_ground(self, xml_path: str) -> Tuple[mujoco.MjModel, mujoco.MjData]:
+    def _load_model_with_ground(
+        self, xml_path: str
+    ) -> Tuple[mujoco.MjModel, mujoco.MjData]:
         """Load a MuJoCo model, ensuring it has a ground plane for physics simulation.
-        
+
         If the model doesn't have a floor/plane geom in worldbody, one is added
         automatically so that physics simulation works correctly. Also checks for
         scene.xml in the same directory and suggests using it if available.
-        
+
         Args:
             xml_path: Path to the MuJoCo XML file.
-            
+
         Returns:
             Tuple of (MjModel, MjData).
         """
         import tempfile
-        
+
         # First, load the model normally to check if it has a ground plane
         model = mujoco.MjModel.from_xml_path(xml_path)
-        
+
         # Check if there's a plane geom in the model (for floor)
         has_ground = False
         for geom_id in range(model.ngeom):
             if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_PLANE:
                 has_ground = True
                 break
-        
+
         if has_ground:
             # Model already has a ground plane, use it as-is
             data = mujoco.MjData(model)
             return model, data
-        
+
         # Model doesn't have a ground plane - check for scene.xml nearby
         xml_dir = os.path.dirname(xml_path)
         xml_basename = os.path.basename(xml_path)
         scene_xml = os.path.join(xml_dir, "scene.xml")
-        
+
         if os.path.exists(scene_xml) and xml_basename != "scene.xml":
             print(
                 f"[Viser] Model has no ground plane. Hint: Consider using '{scene_xml}' "
@@ -873,27 +1076,33 @@ class ViserKeyframeEditor:
                 "your robot with a floor plane for better visualization and physics.",
                 flush=True,
             )
-        
+
         # Check if auto-injection is enabled
-        if not getattr(self.config, 'auto_inject_floor', True):
-            print("[Viser] Auto floor injection disabled. Loading model as-is.", flush=True)
+        if not getattr(self.config, "auto_inject_floor", True):
+            print(
+                "[Viser] Auto floor injection disabled. Loading model as-is.",
+                flush=True,
+            )
             data = mujoco.MjData(model)
             return model, data
-        
+
         # Model doesn't have a ground plane - inject one with enhanced scene
-        print("[Viser] Auto-generating scene wrapper with floor and lighting...", flush=True)
-        
+        print(
+            "[Viser] Auto-generating scene wrapper with floor and lighting...",
+            flush=True,
+        )
+
         try:
             tree = ET.parse(xml_path)
             root = tree.getroot()
-            
+
             # Check if this is a scene file (has worldbody with content) or robot-only
             worldbody = root.find("worldbody")
             is_robot_only = worldbody is None or len(worldbody) == 0
-            
+
             if worldbody is None:
                 worldbody = ET.SubElement(root, "worldbody")
-            
+
             # Add lighting if not present
             if worldbody.find("light") is None:
                 light = ET.Element("light")
@@ -901,7 +1110,7 @@ class ViserKeyframeEditor:
                 light.set("dir", "0 0 -1")
                 light.set("directional", "true")
                 worldbody.insert(0, light)
-            
+
             # Add visual settings if not present
             visual = root.find("visual")
             if visual is None:
@@ -910,12 +1119,12 @@ class ViserKeyframeEditor:
                 headlight.set("diffuse", "0.6 0.6 0.6")
                 headlight.set("ambient", "0.1 0.1 0.1")
                 headlight.set("specular", "0.9 0.9 0.9")
-            
+
             # Add asset section for floor material if not present
             asset = root.find("asset")
             if asset is None:
                 asset = ET.SubElement(root, "asset")
-            
+
             # Add floor texture and material if not present
             if asset.find(".//texture[@name='groundplane']") is None:
                 texture = ET.SubElement(asset, "texture")
@@ -927,34 +1136,34 @@ class ViserKeyframeEditor:
                 texture.set("markrgb", "0.8 0.8 0.8")
                 texture.set("width", "300")
                 texture.set("height", "300")
-                
+
                 material = ET.SubElement(asset, "material")
                 material.set("name", "groundplane")
                 material.set("texture", "groundplane")
                 material.set("texuniform", "true")
                 material.set("texrepeat", "5 5")
                 material.set("reflectance", "0.2")
-            
+
             # Add a floor plane geom at the beginning of worldbody
             # Check if floor already exists
             existing_floor = worldbody.find(".//geom[@name='_keyframe_editor_floor']")
             if existing_floor is not None:
                 worldbody.remove(existing_floor)
-            
+
             floor_geom = ET.Element("geom")
             floor_geom.set("name", "_keyframe_editor_floor")
             floor_geom.set("type", "plane")
             floor_geom.set("size", "10 10 0.05")  # Large floor plane
             floor_geom.set("contype", "1")  # Collision type
             floor_geom.set("conaffinity", "1")  # Collision affinity
-            
+
             # Make floor visible or invisible based on config
-            show_floor = getattr(self.config, 'show_floor', True)
+            show_floor = getattr(self.config, "show_floor", True)
             if show_floor:
                 floor_geom.set("material", "groundplane")
             else:
                 floor_geom.set("rgba", "0.5 0.5 0.5 0")  # Invisible (alpha=0)
-            
+
             # Insert at beginning of worldbody (after light if present)
             if worldbody.find("light") is not None:
                 # Insert after light
@@ -962,17 +1171,14 @@ class ViserKeyframeEditor:
                 worldbody.insert(light_idx + 1, floor_geom)
             else:
                 worldbody.insert(0, floor_geom)
-            
+
             # Write to a temp file in the same directory (so relative asset paths work)
             with tempfile.NamedTemporaryFile(
-                mode='w', 
-                suffix='.xml', 
-                dir=xml_dir, 
-                delete=False
+                mode="w", suffix=".xml", dir=xml_dir, delete=False
             ) as tmp_file:
-                tree.write(tmp_file.name, encoding='unicode')
+                tree.write(tmp_file.name, encoding="unicode")
                 tmp_path = tmp_file.name
-            
+
             try:
                 model = mujoco.MjModel.from_xml_path(tmp_path)
             finally:
@@ -981,22 +1187,25 @@ class ViserKeyframeEditor:
                     os.unlink(tmp_path)
                 except Exception:
                     pass
-                    
+
         except Exception as e:
             # If injection fails, use original model
             print(f"[Viser] Warning: Could not inject ground plane: {e}", flush=True)
-            print("[Viser] Loading original model (physics may not work correctly)", flush=True)
+            print(
+                "[Viser] Loading original model (physics may not work correctly)",
+                flush=True,
+            )
             model = mujoco.MjModel.from_xml_path(xml_path)
-        
+
         data = mujoco.MjData(model)
         return model, data
 
     def _auto_detect_root_body(self) -> str:
         """Auto-detect the root body as the first non-world body that is a direct child of world.
-        
+
         Returns:
             Name of the root body.
-        
+
         Raises:
             ValueError: If no root body could be detected.
         """
@@ -1007,7 +1216,9 @@ class ViserKeyframeEditor:
                 name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
                 if name and name != "world":
                     return name
-        raise ValueError("Could not auto-detect root body: no non-world body found as direct child of world")
+        raise ValueError(
+            "Could not auto-detect root body: no non-world body found as direct child of world"
+        )
 
     # ----- Helper methods for raw MuJoCo -----
     def _get_body_transform(self, body_name: str) -> np.ndarray:
@@ -1021,11 +1232,11 @@ class ViserKeyframeEditor:
 
     def _get_site_transform(self, name: str) -> np.ndarray:
         """Get 4x4 transformation matrix for a site or body.
-        
+
         First tries to find a site with the given name, then falls back to body.
         """
         transformation = np.eye(4)
-        
+
         # Try site first
         try:
             site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, name)
@@ -1037,7 +1248,7 @@ class ViserKeyframeEditor:
                 return transformation
         except Exception:
             pass
-        
+
         # Fall back to body
         try:
             body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
@@ -1049,7 +1260,7 @@ class ViserKeyframeEditor:
                 return transformation
         except Exception:
             pass
-        
+
         raise ValueError(f"Could not find site or body named '{name}'")
 
     def _forward(self) -> None:
@@ -1061,11 +1272,12 @@ class ViserKeyframeEditor:
     def _build_ui(self) -> None:
         """Construct the three-column GUI layout (controls + joint sliders)."""
         left_joints, right_joints = self._split_joint_lists()
+        ee_sites = self._get_ee_sites_for_panels()
         columns_handle: Optional[viser.GuiColumnsHandle]
         try:
             columns_handle = self.server.gui.add_columns(
                 3,
-                widths=(0.25, 0.25, 0.25),
+                widths=(0.15, 0.15, 0.15),
             )
             print(
                 "[Viser] Using gui.add_columns(3) for controls + joint sliders.",
@@ -1083,25 +1295,25 @@ class ViserKeyframeEditor:
             with controls_col:
                 self._build_controls_panel()
                 self._build_keyframe_sequence_panels()
+                self._build_settings_panel()
             with left_col:
                 self._build_joint_slider_column(left_joints, "Joint Sliders (L)")
-                self._build_root_position_sliders()  # Root position below joint sliders
-                self._build_ee_panel()
+                self._build_root_pose_panel()
+                self._build_ee_anchor_panel(ee_sites)
             with right_col:
                 self._build_joint_slider_column(right_joints, "Joint Sliders (R)")
-                self._build_root_orientation_sliders()  # Root orientation below joint sliders
-                self._build_settings_panel()
+                self._build_ee_panel(ee_sites)
             return
 
         # Fallback layout if multi-column support is unavailable
         self._build_controls_panel()
         self._build_keyframe_sequence_panels()
-        self._build_joint_slider_column(left_joints, "Joint Sliders (L)")
-        self._build_joint_slider_column(right_joints, "Joint Sliders (R)")
-        self._build_root_position_sliders()
-        self._build_root_orientation_sliders()
-        self._build_ee_panel()
         self._build_settings_panel()
+        self._build_joint_slider_column(left_joints, "Joint Sliders (L)")
+        self._build_root_pose_panel()
+        self._build_ee_anchor_panel(ee_sites)
+        self._build_joint_slider_column(right_joints, "Joint Sliders (R)")
+        self._build_ee_panel(ee_sites)
 
     def _build_controls_panel(self) -> None:
         """Populate the controls column with visualization toggles."""
@@ -1312,7 +1524,7 @@ class ViserKeyframeEditor:
             ("Left", "Right"),
             ("L_", "R_"),
         ]
-        
+
         for left_pat, right_pat in patterns:
             if left_pat in joint_name:
                 partner = joint_name.replace(left_pat, right_pat, 1)
@@ -1323,7 +1535,7 @@ class ViserKeyframeEditor:
                 if partner in self.joint_names and partner != joint_name:
                     return partner
         return None
-    
+
     def _is_left_side(self, joint_name: str) -> bool:
         """Check if joint is on the left side."""
         left_patterns = ["left", "_l_", "_l", "l_", "_left_", "Left", "L_"]
@@ -1349,113 +1561,192 @@ class ViserKeyframeEditor:
                 processed.add(joint)
                 processed.add(partner)
 
-        unpaired = [
-            joint for joint in self.joint_names if joint not in processed
-        ]
+        unpaired = [joint for joint in self.joint_names if joint not in processed]
         midpoint = (len(unpaired) + 1) // 2
         left_column.extend(unpaired[:midpoint])
         right_column.extend(unpaired[midpoint:])
 
         return left_column, right_column
 
-    def _build_root_position_sliders(self) -> None:
-        """Create sliders for root body position (floating base only)."""
-        if not self.has_floating_base:
-            return  # Skip for fixed-base robots
-        
-        # Get current root position from qpos
+    def _build_root_pose_panel(self) -> None:
+        """Create a unified root pose panel with sliders + viewport gizmo toggle."""
+        if not self.has_floating_base or self.root_slider_widgets:
+            return
+
         current_pos = self.data.qpos[0:3].copy()
-        
-        with self.server.gui.add_folder("Root Position"):
-            # Position sliders (limits -3 to 3, users can type values outside range)
+        current_quat = self.data.qpos[3:7].copy()
+        current_euler = self._quat_to_euler(current_quat)
+
+        with self.server.gui.add_folder("Root Pose"):
+            self.server.gui.add_markdown("_Position_")
             x_slider = self.server.gui.add_slider(
-                "X (m)", min=-3.0, max=3.0, step=0.01, initial_value=float(current_pos[0])
+                "X (m)",
+                min=-3.0,
+                max=3.0,
+                step=0.01,
+                initial_value=float(current_pos[0]),
             )
             y_slider = self.server.gui.add_slider(
-                "Y (m)", min=-3.0, max=3.0, step=0.01, initial_value=float(current_pos[1])
+                "Y (m)",
+                min=-3.0,
+                max=3.0,
+                step=0.01,
+                initial_value=float(current_pos[1]),
             )
             z_slider = self.server.gui.add_slider(
-                "Z (m)", min=-3.0, max=3.0, step=0.01, initial_value=float(current_pos[2])
+                "Z (m)",
+                min=-3.0,
+                max=3.0,
+                step=0.01,
+                initial_value=float(current_pos[2]),
             )
-            
-            # Store references
+
+            self.server.gui.add_markdown("_Orientation_")
+            roll_slider = self.server.gui.add_slider(
+                "Roll (rad)",
+                min=-3.14159,
+                max=3.14159,
+                step=0.01,
+                initial_value=float(current_euler[0]),
+            )
+            pitch_slider = self.server.gui.add_slider(
+                "Pitch (rad)",
+                min=-3.14159,
+                max=3.14159,
+                step=0.01,
+                initial_value=float(current_euler[1]),
+            )
+            yaw_slider = self.server.gui.add_slider(
+                "Yaw (rad)",
+                min=-3.14159,
+                max=3.14159,
+                step=0.01,
+                initial_value=float(current_euler[2]),
+            )
+
+            self.root_pose_gizmo_checked = self.server.gui.add_checkbox(
+                "Root Pose Gizmo (R)",
+                False,
+            )
+
             self.root_slider_widgets["x"] = x_slider
             self.root_slider_widgets["y"] = y_slider
             self.root_slider_widgets["z"] = z_slider
-            
-            # Callback for position updates
-            def update_root_pose(_event: GuiEvent) -> None:
-                if any(id(s) in self._updating_handles for s in self.root_slider_widgets.values()):
-                    return
-                self._apply_root_pose_from_sliders()
-            
-            # Register callbacks
-            x_slider.on_update(update_root_pose)
-            y_slider.on_update(update_root_pose)
-            z_slider.on_update(update_root_pose)
-
-    def _build_root_orientation_sliders(self) -> None:
-        """Create sliders for root body orientation (floating base only)."""
-        if not self.has_floating_base:
-            return  # Skip for fixed-base robots
-        
-        # Get current root orientation from qpos
-        current_quat = self.data.qpos[3:7].copy()
-        current_euler = self._quat_to_euler(current_quat)
-        
-        with self.server.gui.add_folder("Root Orientation"):
-            # Orientation sliders in radians (-π to π ≈ -3.14 to 3.14)
-            roll_slider = self.server.gui.add_slider(
-                "Roll (rad)", min=-3.14159, max=3.14159, step=0.01, initial_value=float(current_euler[0])
-            )
-            pitch_slider = self.server.gui.add_slider(
-                "Pitch (rad)", min=-3.14159, max=3.14159, step=0.01, initial_value=float(current_euler[1])
-            )
-            yaw_slider = self.server.gui.add_slider(
-                "Yaw (rad)", min=-3.14159, max=3.14159, step=0.01, initial_value=float(current_euler[2])
-            )
-            
-            # Store references
             self.root_slider_widgets["roll"] = roll_slider
             self.root_slider_widgets["pitch"] = pitch_slider
             self.root_slider_widgets["yaw"] = yaw_slider
-            
-            # Callback for orientation updates
+
             def update_root_pose(_event: GuiEvent) -> None:
-                if any(id(s) in self._updating_handles for s in self.root_slider_widgets.values()):
+                if any(
+                    id(s) in self._updating_handles
+                    for s in self.root_slider_widgets.values()
+                ):
                     return
                 self._apply_root_pose_from_sliders()
-            
-            # Register callbacks
+
+            x_slider.on_update(update_root_pose)
+            y_slider.on_update(update_root_pose)
+            z_slider.on_update(update_root_pose)
             roll_slider.on_update(update_root_pose)
             pitch_slider.on_update(update_root_pose)
             yaw_slider.on_update(update_root_pose)
+
+            @self.root_pose_gizmo_checked.on_update
+            def _(_event: GuiEvent) -> None:
+                enabled = bool(self.root_pose_gizmo_checked.value)
+                self._set_root_gizmo_enabled(enabled)
+
+    def _toggle_root_gizmo_checkbox(self) -> None:
+        """Toggle the root gizmo checkbox and apply its callback path."""
+        if self.root_pose_gizmo_checked is None:
+            return
+        enabled = not bool(self.root_pose_gizmo_checked.value)
+        self.root_pose_gizmo_checked.value = enabled
+        self._set_root_gizmo_enabled(enabled)
+
+    def _set_root_gizmo_enabled(self, enabled: bool) -> None:
+        """Show/hide the viewport transform controls for root pose."""
+        if not self.has_floating_base:
+            return
+
+        if self.root_pose_gizmo is None:
+            root_pos = tuple(float(v) for v in self.data.qpos[0:3])
+            root_quat = tuple(float(v) for v in self.data.qpos[3:7])
+            handle = self.server.scene.add_transform_controls(
+                "/root_pose_gizmo",
+                scale=0.35,
+                disable_axes=False,
+                disable_sliders=False,
+                disable_rotations=False,
+                position=root_pos,
+                wxyz=root_quat,
+                visible=enabled,
+            )
+
+            @handle.on_update
+            def _(ev) -> None:
+                if self._updating_root_gizmo:
+                    return
+                with self.worker_lock:
+                    pos = np.asarray(ev.target.position, dtype=np.float64)
+                    quat = np.asarray(ev.target.wxyz, dtype=np.float64)
+                    qn = float(np.linalg.norm(quat))
+                    if qn > 1e-12:
+                        quat /= qn
+                    else:
+                        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+                    self.data.qpos[0:3] = pos
+                    self.data.qpos[3:7] = quat
+                    self._forward()
+                    qpos = self.data.qpos.copy()
+                self.worker.update_qpos(qpos)
+                self._sync_root_sliders_from_qpos()
+
+            self.root_pose_gizmo = handle
+        else:
+            self.root_pose_gizmo.visible = enabled
+
+        if enabled:
+            self._sync_root_gizmo_from_qpos()
+
+    def _sync_root_gizmo_from_qpos(self) -> None:
+        """Sync root pose gizmo from current qpos values."""
+        if not self.has_floating_base or self.root_pose_gizmo is None:
+            return
+
+        self._updating_root_gizmo = True
+        try:
+            self.root_pose_gizmo.position = tuple(float(v) for v in self.data.qpos[0:3])
+            self.root_pose_gizmo.wxyz = tuple(float(v) for v in self.data.qpos[3:7])
+        finally:
+            self._updating_root_gizmo = False
 
     def _apply_root_pose_from_sliders(self) -> None:
         """Apply root pose from slider values to qpos and update visualization."""
         if not self.has_floating_base or not self.root_slider_widgets:
             return
-        
+
         # Get position from sliders
         x = float(self.root_slider_widgets["x"].value)
         y = float(self.root_slider_widgets["y"].value)
         z = float(self.root_slider_widgets["z"].value)
-        
+
         # Get orientation from sliders and convert to quaternion
         roll = float(self.root_slider_widgets["roll"].value)
         pitch = float(self.root_slider_widgets["pitch"].value)
         yaw = float(self.root_slider_widgets["yaw"].value)
         quat = self._euler_to_quat(roll, pitch, yaw)
-        
+
         # Update qpos
         self.data.qpos[0] = x
         self.data.qpos[1] = y
         self.data.qpos[2] = z
         self.data.qpos[3:7] = quat
-        
+
         # Forward kinematics to update derived quantities
         mujoco.mj_forward(self.model, self.data)
-        
+        self._sync_root_gizmo_from_qpos()
+
         # Also update worker's data
         self.worker.update_qpos(self.data.qpos.copy())
 
@@ -1463,12 +1754,12 @@ class ViserKeyframeEditor:
         """Sync root pose sliders from current qpos values."""
         if not self.has_floating_base or not self.root_slider_widgets:
             return
-        
+
         # Get current root pose from qpos
         pos = self.data.qpos[0:3]
         quat = self.data.qpos[3:7]
         euler = self._quat_to_euler(quat)
-        
+
         # Update sliders without triggering callbacks
         self._set_handle_value(self.root_slider_widgets["x"], float(pos[0]))
         self._set_handle_value(self.root_slider_widgets["y"], float(pos[1]))
@@ -1476,6 +1767,7 @@ class ViserKeyframeEditor:
         self._set_handle_value(self.root_slider_widgets["roll"], float(euler[0]))
         self._set_handle_value(self.root_slider_widgets["pitch"], float(euler[1]))
         self._set_handle_value(self.root_slider_widgets["yaw"], float(euler[2]))
+        self._sync_root_gizmo_from_qpos()
 
     def _build_joint_slider_column(self, joints: List[str], title: str) -> None:
         """Create a folder populated with sliders for the provided joints."""
@@ -1506,9 +1798,7 @@ class ViserKeyframeEditor:
         rounded_max = round(jmax, 2)
         span = max(rounded_max - rounded_min, 1e-6)
         step = max(span / 4000.0, 1e-4)
-        default_val = float(
-            self.default_positions.get(joint_name, (jmin + jmax) * 0.5)
-        )
+        default_val = float(self.default_positions.get(joint_name, (jmin + jmax) * 0.5))
         default_val = min(max(default_val, rounded_min), rounded_max)
 
         label = self._format_joint_label(joint_name)
@@ -1548,7 +1838,9 @@ class ViserKeyframeEditor:
     def _build_robot_meshes(self) -> None:
         """Populate `self._geom_handles` with MuJoCo meshes."""
         if trimesh is None:
-            print("[Viser] trimesh not installed, skipping mesh visualization", flush=True)
+            print(
+                "[Viser] trimesh not installed, skipping mesh visualization", flush=True
+            )
             return
 
         self._geom_handles.clear()
@@ -1655,7 +1947,10 @@ class ViserKeyframeEditor:
                                 vals = [float(x) for x in quat_txt.strip().split()]
                                 if len(vals) == 4:
                                     self._mesh_quat_map[name] = (
-                                        vals[0], vals[1], vals[2], vals[3],
+                                        vals[0],
+                                        vals[1],
+                                        vals[2],
+                                        vals[3],
                                     )
                             except Exception:
                                 pass
@@ -1744,7 +2039,7 @@ class ViserKeyframeEditor:
             size = np.array(geom_size[i])
             rgba = tuple(map(float, geom_rgba[i]))
             group = int(geom_group[i])
-            
+
             # First, try to get color from MuJoCo material assignment
             mat_id = int(geom_matid[i]) if geom_matid is not None else -1
             if mat_id >= 0 and mat_rgba is not None and mat_id < len(mat_rgba):
@@ -1983,16 +2278,23 @@ class ViserKeyframeEditor:
         for name, t in self.sequence_list:
             for kf in self.keyframes:
                 if kf.name == name and kf.qpos is not None:
-                    action_list.append(kf.motor_pos)
+                    # Recompute actuator-space targets from qpos to keep trajectory
+                    # playback consistent with IK-edited poses.
+                    action_list.append(self._get_motor_pos_from_qpos(kf.qpos))
                     qpos_list.append(kf.qpos)
                     times.append(t)
                     break
         if len(times) < 2:
-            print(f"[Viser] Action traj: collected fewer than 2 timestamps.", flush=True)
+            print(
+                f"[Viser] Action traj: collected fewer than 2 timestamps.", flush=True
+            )
             return
         times_arr = np.array(times)
         if np.any(np.diff(times_arr) <= 0):
-            print(f"[Viser] Action traj: times not strictly increasing: {times}", flush=True)
+            print(
+                f"[Viser] Action traj: times not strictly increasing: {times}",
+                flush=True,
+            )
             return
         qpos_start = qpos_list[start_idx]
         enabled = bool(self.physics_enabled.value) if self.physics_enabled else True
@@ -2038,15 +2340,23 @@ class ViserKeyframeEditor:
         if len(times) < 2:
             print(f"[Viser] Qpos traj: collected fewer than 2 timestamps.", flush=True)
             return
-        
+
         # Debug: check if qpos values are actually different
         qpos_diff = np.max(np.abs(np.array(qpos_list[0]) - np.array(qpos_list[-1])))
-        print(f"[Viser] Qpos traj: max qpos diff between first and last: {qpos_diff:.6f}", flush=True)
+        print(
+            f"[Viser] Qpos traj: max qpos diff between first and last: {qpos_diff:.6f}",
+            flush=True,
+        )
         if qpos_diff < 1e-6:
-            print("[Viser] WARNING: Keyframes have nearly identical qpos! Move sliders between keyframes.", flush=True)
+            print(
+                "[Viser] WARNING: Keyframes have nearly identical qpos! Move sliders between keyframes.",
+                flush=True,
+            )
         times_arr = np.array(times)
         if np.any(np.diff(times_arr) <= 0):
-            print(f"[Viser] Qpos traj: times not strictly increasing: {times}", flush=True)
+            print(
+                f"[Viser] Qpos traj: times not strictly increasing: {times}", flush=True
+            )
             return
         times_arr = times_arr - times_arr[0]
         self.traj_times = list(np.arange(0, times_arr[-1], self.dt))
@@ -2092,19 +2402,25 @@ class ViserKeyframeEditor:
             result_dict["site_pos"] = np.array(self.site_pos_replay)
             result_dict["site_quat"] = np.array(self.site_quat_replay)
             result_dict["action"] = (
-                None if self.is_qpos_traj else np.array(self.action_traj) if self.action_traj else None
+                None
+                if self.is_qpos_traj
+                else np.array(self.action_traj)
+                if self.action_traj
+                else None
             )
             result_dict["keyframes"] = saved_keyframes
             result_dict["timed_sequence"] = self.sequence_list
             result_dict["is_robot_relative_frame"] = self.is_relative_frame
 
             motion_name = (
-                self.motion_name_input.value if self.motion_name_input else self.config.name
+                self.motion_name_input.value
+                if self.motion_name_input
+                else self.config.name
             )
-            
+
             # Ensure directory exists
             os.makedirs(self.result_dir, exist_ok=True)
-            
+
             # Save as {motion_name}.lz4 - overwrites previous save with same name
             result_path = os.path.join(self.result_dir, f"{motion_name}.lz4")
             joblib.dump(result_dict, result_path, compress="lz4")
@@ -2120,10 +2436,10 @@ class ViserKeyframeEditor:
         self._refresh_sequence_table()
 
         # Create default keyframe
-        default_motor_pos = np.zeros(self.model.nu, dtype=np.float32)
+        default_motor_pos = self._get_motor_pos_from_qpos(self.home_qpos)
         default_joint_pos = np.array(
             [self.default_positions.get(name, 0.0) for name in self.joint_names],
-            dtype=np.float32
+            dtype=np.float32,
         )
 
         if not self.data_path:
@@ -2141,7 +2457,7 @@ class ViserKeyframeEditor:
             # Don't load keyframe to UI yet - let grounding happen first
             # The grounded position will be applied via _update_default_keyframe_after_ground()
             return False
-        
+
         if not os.path.exists(self.data_path):
             print(f"[Load] ❌ File not found: {self.data_path}", flush=True)
             self.keyframes.append(
@@ -2205,11 +2521,14 @@ class ViserKeyframeEditor:
             self.joint_vel_replay = list(data.get("joint_vel", []))
             self._refresh_keyframes_table()
             self._refresh_sequence_table()
-            print(f"[Load] ✅ Loaded {len(self.keyframes)} keyframes, {len(self.sequence_list)} sequence entries", flush=True)
+            print(
+                f"[Load] ✅ Loaded {len(self.keyframes)} keyframes, {len(self.sequence_list)} sequence entries",
+                flush=True,
+            )
             if self.keyframes:
                 self._load_keyframe_to_ui(0)
             return True
-        
+
         # No keyframes in data
         print("[Load] ⚠️ No keyframes found in file", flush=True)
         self.keyframes.append(
@@ -2227,10 +2546,10 @@ class ViserKeyframeEditor:
     # -- Keyframe operations --
 
     def _add_keyframe(self) -> None:
-        default_motor_pos = np.zeros(self.model.nu, dtype=np.float32)
+        default_motor_pos = self._get_motor_pos_from_qpos(self.home_qpos)
         default_joint_pos = np.array(
             [self.default_positions.get(name, 0.0) for name in self.joint_names],
-            dtype=np.float32
+            dtype=np.float32,
         )
 
         if self.selected_keyframe is None:
@@ -2412,21 +2731,24 @@ class ViserKeyframeEditor:
         # Get the current qpos from the simulation (grounded position)
         with self.worker_lock:
             grounded_qpos = self.data.qpos.copy()
-        
+
         # Update the default keyframe
         if self.keyframes:
             self.keyframes[0].qpos = grounded_qpos
+            self.keyframes[0].motor_pos = self._get_motor_pos_from_qpos(grounded_qpos)
             # Also update joint positions from the grounded qpos
             joint_pos = []
             for jname in self.joint_names:
                 try:
-                    jnt_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+                    jnt_id = mujoco.mj_name2id(
+                        self.model, mujoco.mjtObj.mjOBJ_JOINT, jname
+                    )
                     qpos_adr = self.model.jnt_qposadr[jnt_id]
                     joint_pos.append(float(grounded_qpos[qpos_adr]))
                 except Exception:
                     joint_pos.append(0.0)
             self.keyframes[0].joint_pos = np.array(joint_pos, dtype=np.float32)
-        
+
         # Now load the keyframe to UI
         self._load_keyframe_to_ui(0)
 
@@ -2436,7 +2758,16 @@ class ViserKeyframeEditor:
         kf = self.keyframes[self.selected_keyframe]
         if kf.qpos is None:
             return
-        self.worker.request_keyframe_test(kf, self.dt)
+        # Ensure motor target is synchronized with current qpos before testing.
+        kf.motor_pos = self._get_motor_pos_from_qpos(kf.qpos)
+        physics_enabled = (
+            bool(self.physics_enabled.value) if self.physics_enabled else True
+        )
+        self.worker.request_keyframe_test(
+            kf,
+            self.dt,
+            physics_enabled=physics_enabled,
+        )
 
     def _set_handle_value(self, handle, value: object) -> None:
         hid = id(handle)
@@ -2479,7 +2810,7 @@ class ViserKeyframeEditor:
                     updates[mirrored_joint_name] = value * mirror_sign
                 elif rev_mirror:
                     updates[mirrored_joint_name] = -value * mirror_sign
-        
+
         # Apply inverse computation for gear mechanisms: when a driven joint is set,
         # compute the corresponding drive joint value
         # driven = offset + ratio * drive  =>  drive = (driven - offset) / ratio
@@ -2491,7 +2822,7 @@ class ViserKeyframeEditor:
                     drive_value = (driven_value - offset) / ratio
                     gear_inverse_updates[drive_joint] = drive_value
         updates.update(gear_inverse_updates)
-        
+
         # Apply forward computation for gear mechanisms: when a drive joint moves,
         # its coupled driven joint must also move according to the gear ratio
         # driven = offset + ratio * drive
@@ -2502,22 +2833,28 @@ class ViserKeyframeEditor:
                 driven_value = offset + ratio * drive_value
                 coupled_updates[driven_joint] = driven_value
         updates.update(coupled_updates)
-        
+
         # Apply inverse computation for differential drives: when a motion joint changes,
         # compute the corresponding motor joint values by solving the tendon constraint system
         differential_updates: Dict[str, float] = {}
-        
+
         # Group motion joints by shared motors (same differential drive system)
-        motor_groups: Dict[frozenset, List[Tuple[str, str, float]]] = {}  # {motor_names} -> [(motion_name, tendon_name, motion_coef), ...]
-        
+        motor_groups: Dict[
+            frozenset, List[Tuple[str, str, float]]
+        ] = {}  # {motor_names} -> [(motion_name, tendon_name, motion_coef), ...]
+
         for motion_joint in updates.keys():
             if motion_joint in self.differential_drives:
-                tendon_name, motor_list, motion_coef = self.differential_drives[motion_joint]
+                tendon_name, motor_list, motion_coef = self.differential_drives[
+                    motion_joint
+                ]
                 motor_names = frozenset(m[0] for m in motor_list)
                 if motor_names not in motor_groups:
                     motor_groups[motor_names] = []
-                motor_groups[motor_names].append((motion_joint, tendon_name, motion_coef))
-        
+                motor_groups[motor_names].append(
+                    (motion_joint, tendon_name, motion_coef)
+                )
+
         # For each motor group, solve the system
         for motor_names, motion_list in motor_groups.items():
             if len(motor_names) == 2 and len(motion_list) == 2:
@@ -2527,40 +2864,48 @@ class ViserKeyframeEditor:
                 for motion_name, tendon_name, _ in motion_list:
                     # Find the tendon and get all coefficients
                     for tendon_id in range(self.model.ntendon):
-                        tn = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id)
+                        tn = mujoco.mj_id2name(
+                            self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id
+                        )
                         if tn == tendon_name:
                             adr = self.model.tendon_adr[tendon_id]
                             num = self.model.tendon_num[tendon_id]
-                            
+
                             motors = []
                             motions = []
                             for i in range(num):
                                 wrap_idx = adr + i
                                 obj_id = self.model.wrap_objid[wrap_idx]
                                 coef = float(self.model.wrap_prm[wrap_idx])
-                                jname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id)
-                                
+                                jname = mujoco.mj_id2name(
+                                    self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id
+                                )
+
                                 if jname in motor_names:
                                     motors.append((jname, coef))
                                 else:
                                     motions.append((jname, coef))
-                            
+
                             all_tendons.append((motors, motions))
                             break
-                
+
                 if len(all_tendons) == 2:
                     # Solve 2x2 system: c1*m1 + c2*m2 + cr*roll = 0, d1*m1 + d2*m2 + dy*yaw = 0
                     (m1_name, c1), (m2_name, c2) = all_tendons[0][0]
                     (m1_name2, d1), (m2_name2, d2) = all_tendons[1][0]
-                    
+
                     (r_name, cr) = all_tendons[0][1][0]
                     (y_name, dy) = all_tendons[1][1][0]
-                    
+
                     # Get current or updated values
                     with self.worker_lock:
-                        roll_val = updates.get(r_name, float(self.data.joint(r_name).qpos[0]))
-                        yaw_val = updates.get(y_name, float(self.data.joint(y_name).qpos[0]))
-                    
+                        roll_val = updates.get(
+                            r_name, float(self.data.joint(r_name).qpos[0])
+                        )
+                        yaw_val = updates.get(
+                            y_name, float(self.data.joint(y_name).qpos[0])
+                        )
+
                     # Solve: c1*m1 + c2*m2 = -cr*roll
                     #        d1*m1 + d2*m2 = -dy*yaw
                     # Using Cramer's rule:
@@ -2570,12 +2915,12 @@ class ViserKeyframeEditor:
                     if abs(det) > 1e-6:
                         m1_val = (-cr * roll_val * d2 + dy * yaw_val * c2) / det
                         m2_val = (-c1 * dy * yaw_val + cr * roll_val * d1) / det
-                        
+
                         differential_updates[m1_name] = m1_val
                         differential_updates[m2_name] = m2_val
-        
+
         updates.update(differential_updates)
-        
+
         # Apply inverse computation for parallel linkages: when a motion joint changes,
         # compute the corresponding motor joint value
         # motion = ratio * motor  =>  motor = motion / ratio
@@ -2587,7 +2932,7 @@ class ViserKeyframeEditor:
                     motor_value = motion_value / ratio
                     parallel_inverse_updates[motor_joint] = motor_value
         updates.update(parallel_inverse_updates)
-        
+
         # Apply passive rod joint updates: when a motor joint moves,
         # the passive rods must also rotate to maintain visual correctness.
         # Uses the approximation: rod_angle ≈ -motor_angle (for typical parallel linkages)
@@ -2599,7 +2944,7 @@ class ViserKeyframeEditor:
                     rod_value = motor_value * ratio
                     passive_rod_updates[rod_joint] = rod_value
         updates.update(passive_rod_updates)
-        
+
         self.worker.update_joint_angles(updates)
         return updates
 
@@ -2651,7 +2996,14 @@ class ViserKeyframeEditor:
         if not tokens:
             return joint_name
         # Map common prefixes/tokens to abbreviations
-        token_map = {"left": "L", "right": "R", "l": "L", "r": "R", "front": "F", "back": "B"}
+        token_map = {
+            "left": "L",
+            "right": "R",
+            "l": "L",
+            "r": "R",
+            "front": "F",
+            "back": "B",
+        }
         formatted_tokens: List[str] = []
         for tok in tokens:
             lower_tok = tok.lower()
@@ -2665,20 +3017,20 @@ class ViserKeyframeEditor:
 
     def _discover_end_effector_sites(self) -> List[str]:
         """Auto-discover end-effector sites by finding leaf bodies (bodies with no children).
-        
+
         In a kinematic chain, end effectors are the terminal links that have no child bodies.
         This method finds all leaf bodies and returns the sites attached to them, excluding
         internal constraint sites (group >= 3 or referenced in equality constraints).
         """
         # Find all body parent IDs to identify which bodies have children
         parent_ids = set(self.model.body_parentid)
-        
+
         # Find leaf bodies (bodies that are NOT parents of any other body)
         leaf_body_ids = []
         for body_id in range(self.model.nbody):
             if body_id not in parent_ids:
                 leaf_body_ids.append(body_id)
-        
+
         # Build set of sites referenced in equality CONNECT constraints (internal constraint points)
         equality_site_ids = set()
         for eq_id in range(self.model.neq):
@@ -2686,76 +3038,150 @@ class ViserKeyframeEditor:
                 # For CONNECT constraints, obj1id and obj2id are site IDs
                 equality_site_ids.add(self.model.eq_obj1id[eq_id])
                 equality_site_ids.add(self.model.eq_obj2id[eq_id])
-        
+
         # End-effector keywords to identify legitimate end-effector sites even with high group numbers
-        ee_keywords = ["foot", "hand", "gripper", "ee", "end_effector", "tip", "toe", "palm"]
-        
+        ee_keywords = [
+            "foot",
+            "hand",
+            "gripper",
+            "ee",
+            "end_effector",
+            "tip",
+            "toe",
+            "palm",
+        ]
+
         # For each leaf body, look for attached sites
         ee_sites = []
         for body_id in leaf_body_ids:
             body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
             if body_name is None or body_name == "world":
                 continue
-            
+
             # Find sites attached to this body
             for site_id in range(self.model.nsite):
                 if self.model.site_bodyid[site_id] == body_id:
-                    site_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_SITE, site_id)
+                    site_name = mujoco.mj_id2name(
+                        self.model, mujoco.mjtObj.mjOBJ_SITE, site_id
+                    )
                     if not site_name:
                         continue
-                    
+
                     # Filter 1: Always exclude sites referenced in equality CONNECT constraints
                     if site_id in equality_site_ids:
                         continue
-                    
+
                     # Filter 2: Exclude sites with group >= 3 UNLESS they have end-effector-like names
                     site_lower = site_name.lower()
                     is_ee_like = any(kw in site_lower for kw in ee_keywords)
-                    
+
                     if self.model.site_group[site_id] >= 3 and not is_ee_like:
                         continue
-                    
+
                     ee_sites.append(site_name)
-        
+
         # If no sites found, fall back to leaf body names
         if not ee_sites:
-            body_ee_keywords = ["foot", "hand", "calf", "leg", "lleg", "ankle", "toe", "gripper"]
+            body_ee_keywords = [
+                "foot",
+                "hand",
+                "calf",
+                "leg",
+                "lleg",
+                "ankle",
+                "toe",
+                "gripper",
+            ]
             for body_id in leaf_body_ids:
-                body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+                body_name = mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_BODY, body_id
+                )
                 if body_name is None or body_name == "world":
                     continue
                 # Check if body name contains any end-effector keywords
                 body_lower = body_name.lower()
                 if any(kw in body_lower for kw in body_ee_keywords):
                     ee_sites.append(body_name)
-            
+
             # If still no matches, just use all leaf bodies
             if not ee_sites:
                 for body_id in leaf_body_ids:
-                    body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+                    body_name = mujoco.mj_id2name(
+                        self.model, mujoco.mjtObj.mjOBJ_BODY, body_id
+                    )
                     if body_name and body_name != "world":
                         ee_sites.append(body_name)
-        
+
         return ee_sites
 
-    def _build_ee_panel(self) -> None:
-        """Build end-effector pose saving/loading panel."""
-        with self.server.gui.add_folder("👣 End Effector Poses"):
-            # Use configured sites or auto-discover from leaf bodies
-            sites = self.config.end_effector_sites
-            if sites is None:
-                sites = self._discover_end_effector_sites()
-                if sites:
-                    print(f"[Viser] Auto-discovered EE sites from leaf bodies: {sites}", flush=True)
-            
-            if not sites:
-                self.server.gui.add_markdown("_No end-effector sites found._")
-                return
+    def _get_ee_sites_for_panels(self) -> List[str]:
+        """Get EE sites used by IK and anchor GUI panels."""
+        # Use configured sites or auto-discover from leaf bodies
+        sites = self.config.end_effector_sites
+        if sites is None:
+            sites = self._discover_end_effector_sites()
+            if sites:
+                print(
+                    f"[Viser] Auto-discovered EE sites from leaf bodies: {sites}",
+                    flush=True,
+                )
 
-            for site_name in sites[:8]:  # Limit to 8 sites for UI space
-                short_name = site_name.replace("_center", "").replace("_site", "").replace("_", " ").title()
-                
+        if not sites:
+            self._ik_target_sites = []
+            return []
+
+        shown_sites = sites[:8]
+        self._ik_target_sites = shown_sites.copy()
+        return shown_sites
+
+    def _build_ee_panel(self, shown_sites: Optional[List[str]] = None) -> None:
+        """Build inverse kinematics panel."""
+        if shown_sites is None:
+            shown_sites = self._get_ee_sites_for_panels()
+        if not shown_sites:
+            self.server.gui.add_markdown("_No end-effector sites found._")
+            return
+
+        shown_txt = ", ".join(shown_sites)
+        if len(self._ik_target_sites) > len(shown_sites):
+            shown_txt += (
+                f", ... (+{len(self._ik_target_sites) - len(shown_sites)} more)"
+            )
+
+        with self.server.gui.add_folder("Inverse Kinematics (IK)"):
+            self.ik_targets_toggle_button = self.server.gui.add_button(
+                "Toggle Targets (T)"
+            )
+            self.ik_targets_status = self.server.gui.add_markdown(
+                f"_Available targets_: `{shown_txt}`"
+            )
+
+            @self.ik_targets_toggle_button.on_click
+            def _(_e: GuiEvent) -> None:
+                self._toggle_ik_targets()
+
+            self._build_ik_target_sliders(shown_sites)
+            self._set_ik_target_ui_state(bool(self.ee_target_handles))
+
+    def _build_ee_anchor_panel(self, shown_sites: Optional[List[str]] = None) -> None:
+        """Build end-effector anchor panel."""
+        if shown_sites is None:
+            shown_sites = self._get_ee_sites_for_panels()
+        if not shown_sites:
+            return
+
+        with self.server.gui.add_folder("End-Effector Pose Anchors"):
+            self.server.gui.add_markdown("_Per-site pose tools_: save/apply only.")
+            for site_name in shown_sites:
+                short_name = (
+                    site_name.replace("_center", "")
+                    .replace("_site", "")
+                    .replace("_", " ")
+                    .title()
+                )
+
                 save_btn = self.server.gui.add_button(f"Save {short_name}")
+
                 @save_btn.on_click
                 def _(_e: GuiEvent, sname=site_name) -> None:
                     with self.worker_lock:
@@ -2766,6 +3192,7 @@ class ViserKeyframeEditor:
                             print(f"[Viser] Failed to save {sname}: {exc}", flush=True)
 
                 apply_btn = self.server.gui.add_button(f"Apply {short_name}")
+
                 @apply_btn.on_click
                 def _(_e: GuiEvent, sname=site_name) -> None:
                     if sname in self.saved_ee_poses:
@@ -2773,9 +3200,211 @@ class ViserKeyframeEditor:
                     else:
                         print(f"[Viser] No saved pose for {sname}.", flush=True)
 
-    def _align_to_pose(
-        self, site_name: str, target_pose: Optional[np.ndarray]
+    def _get_site_or_body_position(self, site_name: str) -> np.ndarray:
+        """Return world position for a site or body name."""
+        pos, _quat = self._get_site_or_body_pose(site_name)
+        return pos
+
+    def _get_site_or_body_pose(self, site_name: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Return world pose (position, wxyz quaternion) for a site or body name."""
+        with self.worker_lock:
+            site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+            if site_id >= 0:
+                pos = self.data.site(site_id).xpos.copy().astype(np.float64)
+                mat = self.data.site(site_id).xmat.reshape(3, 3).copy()
+                quat = R.from_matrix(mat).as_quat(scalar_first=True).astype(np.float64)
+                return pos, quat
+            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, site_name)
+            if body_id >= 0:
+                pos = self.data.xpos[body_id].copy().astype(np.float64)
+                mat = self.data.xmat[body_id].reshape(3, 3).copy()
+                quat = R.from_matrix(mat).as_quat(scalar_first=True).astype(np.float64)
+                return pos, quat
+        raise ValueError(f"Unknown site/body: {site_name}")
+
+    def _build_ik_target_sliders(self, sites: List[str]) -> None:
+        """Create per-target pose sliders for precise IK target tuning."""
+        self.ee_target_slider_widgets.clear()
+        self.ee_target_slider_folders.clear()
+
+        for site_name in sites:
+            try:
+                current_pos, current_quat = self._get_site_or_body_pose(site_name)
+                initial_pos = self.ee_target_positions.get(site_name, current_pos)
+                initial_quat = self.ee_target_orientations.get(site_name, current_quat)
+            except Exception:
+                continue
+            self.ee_target_positions[site_name] = np.asarray(
+                initial_pos, dtype=np.float64
+            )
+            self.ee_target_orientations[site_name] = np.asarray(
+                initial_quat, dtype=np.float64
+            )
+            roll0, pitch0, yaw0 = self._quat_to_euler(
+                np.asarray(self.ee_target_orientations[site_name], dtype=np.float64)
+            )
+
+            short_name = (
+                site_name.replace("_center", "")
+                .replace("_site", "")
+                .replace("_", " ")
+                .title()
+            )
+            with self.server.gui.add_folder(
+                short_name, expand_by_default=False
+            ) as target_folder:
+                x_slider = self.server.gui.add_slider(
+                    "X (m)",
+                    min=-3.0,
+                    max=3.0,
+                    step=0.005,
+                    initial_value=float(initial_pos[0]),
+                )
+                y_slider = self.server.gui.add_slider(
+                    "Y (m)",
+                    min=-3.0,
+                    max=3.0,
+                    step=0.005,
+                    initial_value=float(initial_pos[1]),
+                )
+                z_slider = self.server.gui.add_slider(
+                    "Z (m)",
+                    min=-0.2,
+                    max=2.5,
+                    step=0.005,
+                    initial_value=float(initial_pos[2]),
+                )
+                roll_slider = self.server.gui.add_slider(
+                    "Roll (rad)",
+                    min=-3.14159,
+                    max=3.14159,
+                    step=0.01,
+                    initial_value=float(roll0),
+                )
+                pitch_slider = self.server.gui.add_slider(
+                    "Pitch (rad)",
+                    min=-3.14159,
+                    max=3.14159,
+                    step=0.01,
+                    initial_value=float(pitch0),
+                )
+                yaw_slider = self.server.gui.add_slider(
+                    "Yaw (rad)",
+                    min=-3.14159,
+                    max=3.14159,
+                    step=0.01,
+                    initial_value=float(yaw0),
+                )
+                self.ee_target_slider_widgets[site_name] = {
+                    "x": x_slider,
+                    "y": y_slider,
+                    "z": z_slider,
+                    "roll": roll_slider,
+                    "pitch": pitch_slider,
+                    "yaw": yaw_slider,
+                }
+                self.ee_target_slider_folders[site_name] = target_folder
+
+                def on_target_slider_update(_event: GuiEvent, sname=site_name) -> None:
+                    sliders = self.ee_target_slider_widgets.get(sname)
+                    if not sliders:
+                        return
+                    if any(id(s) in self._updating_handles for s in sliders.values()):
+                        return
+
+                    target_pos = np.array(
+                        [
+                            float(sliders["x"].value),
+                            float(sliders["y"].value),
+                            float(sliders["z"].value),
+                        ],
+                        dtype=np.float64,
+                    )
+                    target_quat = self._euler_to_quat(
+                        float(sliders["roll"].value),
+                        float(sliders["pitch"].value),
+                        float(sliders["yaw"].value),
+                    )
+                    self.ee_target_positions[sname] = target_pos
+                    self.ee_target_orientations[sname] = target_quat
+
+                    handle = self.ee_target_handles.get(sname)
+                    if handle is not None:
+                        self._updating_ik_target_handles.add(sname)
+                        try:
+                            handle.position = tuple(float(v) for v in target_pos)
+                            handle.wxyz = tuple(float(v) for v in target_quat)
+                        finally:
+                            self._updating_ik_target_handles.discard(sname)
+
+                    if self.ee_target_handles:
+                        self._ik_to_targets(
+                            max_iters=20,
+                            tol=4e-3,
+                            quiet=True,
+                        )
+                    else:
+                        self._ik_to_position_target(
+                            sname,
+                            target_pos,
+                            target_wxyz=target_quat,
+                            max_iters=24,
+                            tol=2e-3,
+                            quiet=True,
+                        )
+
+                x_slider.on_update(on_target_slider_update)
+                y_slider.on_update(on_target_slider_update)
+                z_slider.on_update(on_target_slider_update)
+                roll_slider.on_update(on_target_slider_update)
+                pitch_slider.on_update(on_target_slider_update)
+                yaw_slider.on_update(on_target_slider_update)
+
+    def _set_ik_target_ui_state(self, targets_active: bool) -> None:
+        """Sync IK panel elements for active/inactive target state."""
+        for folder in self.ee_target_slider_folders.values():
+            folder.visible = targets_active
+            if hasattr(folder, "expand_by_default"):
+                folder.expand_by_default = False
+
+        if self.ik_targets_toggle_button is not None:
+            self.ik_targets_toggle_button.label = (
+                "Clear Targets (T)" if targets_active else "Create Targets (T)"
+            )
+
+        if self.ik_targets_status is not None:
+            names = ", ".join(self._ik_target_sites)
+            if targets_active:
+                self.ik_targets_status.content = f"_Active targets_: `{names}`"
+            else:
+                self.ik_targets_status.content = f"_Available targets_: `{names}`"
+
+    def _sync_ik_target_sliders(
+        self,
+        site_name: str,
+        target_pos: np.ndarray,
+        target_wxyz: Optional[np.ndarray] = None,
     ) -> None:
+        """Sync target pose sliders from target gizmo without triggering callbacks."""
+        sliders = self.ee_target_slider_widgets.get(site_name)
+        if not sliders:
+            return
+        self._set_handle_value(sliders["x"], float(target_pos[0]))
+        self._set_handle_value(sliders["y"], float(target_pos[1]))
+        self._set_handle_value(sliders["z"], float(target_pos[2]))
+        quat = (
+            np.asarray(target_wxyz, dtype=np.float64)
+            if target_wxyz is not None
+            else self.ee_target_orientations.get(site_name)
+        )
+        if quat is None:
+            return
+        roll, pitch, yaw = self._quat_to_euler(np.asarray(quat, dtype=np.float64))
+        self._set_handle_value(sliders["roll"], float(roll))
+        self._set_handle_value(sliders["pitch"], float(pitch))
+        self._set_handle_value(sliders["yaw"], float(yaw))
+
+    def _align_to_pose(self, site_name: str, target_pose: Optional[np.ndarray]) -> None:
         """Align the root body so that `site_name` matches `target_pose`."""
         if target_pose is None:
             print(f"[Viser] No saved pose for {site_name}.", flush=True)
@@ -2792,27 +3421,588 @@ class ViserKeyframeEditor:
             self._forward()
         print(f"[Viser] {site_name} aligned to saved pose.", flush=True)
 
+    def _ik_to_position_target(
+        self,
+        site_name: str,
+        target_pos: np.ndarray,
+        *,
+        target_wxyz: Optional[np.ndarray] = None,
+        max_iters: int = 80,
+        tol: float = 2e-3,
+        quiet: bool = False,
+    ) -> Tuple[bool, float]:
+        """Run IK for a single site to a target pose (position + optional orientation)."""
+        with self.worker_lock:
+            ok, final_err = self._solve_position_ik(
+                site_name=site_name,
+                target_pos=target_pos,
+                target_wxyz=target_wxyz,
+                max_iters=max_iters,
+                tol=tol,
+            )
+            solved_qpos = self.data.qpos.copy()
+
+        self.worker.update_qpos(solved_qpos)
+        self.worker.request_state_data()
+
+        if not quiet:
+            if ok:
+                print(
+                    f"[Viser][IK] Solved {site_name} to target (position err={final_err:.4f} m).",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[Viser][IK] Best effort for {site_name} (position err={final_err:.4f} m).",
+                    flush=True,
+                )
+        return ok, final_err
+
+    def _make_mink_target_pose(
+        self, target_pos: np.ndarray, target_wxyz: Optional[np.ndarray]
+    ) -> object:
+        """Construct an SE3 target for Mink from position and optional orientation."""
+        target_pos = np.asarray(target_pos, dtype=np.float64)
+        if target_wxyz is None:
+            return mink.SE3.from_translation(target_pos)
+
+        quat = np.asarray(target_wxyz, dtype=np.float64)
+        qn = float(np.linalg.norm(quat))
+        if qn <= 1e-12:
+            return mink.SE3.from_translation(target_pos)
+        quat = quat / qn
+        rot_mat = R.from_quat(quat, scalar_first=True).as_matrix()
+        return mink.SE3.from_rotation_and_translation(
+            mink.SO3.from_matrix(rot_mat),
+            target_pos,
+        )
+
+    def _solve_position_ik(
+        self,
+        site_name: str,
+        target_pos: np.ndarray,
+        *,
+        target_wxyz: Optional[np.ndarray] = None,
+        max_iters: int = 80,
+        tol: float = 2e-3,
+    ) -> Tuple[bool, float]:
+        """Solve IK using Mink."""
+        return self._solve_position_ik_mink(
+            site_name=site_name,
+            target_pos=target_pos,
+            target_wxyz=target_wxyz,
+            max_iters=max_iters,
+            tol=tol,
+        )
+
+    def _toggle_ik_targets(self) -> None:
+        """Toggle EE IK target gizmos on/off via keyboard hotkey."""
+        if self.ee_target_handles:
+            self._clear_ee_targets(clear_positions=False)
+            self._set_ik_target_ui_state(False)
+            print("[Viser][IK] Cleared IK targets (hotkey: T).", flush=True)
+            return
+        if not self._ik_target_sites:
+            print(
+                "[Viser][IK] No IK targets configured yet. Open the IK panel first.",
+                flush=True,
+            )
+            return
+        self._create_ee_targets(self._ik_target_sites, reset_to_current=True)
+        self._set_ik_target_ui_state(True)
+
+    def _create_ee_targets(
+        self, sites: List[str], *, reset_to_current: bool = False
+    ) -> None:
+        """Create draggable scene gizmos for end-effector IK targets."""
+        self._clear_ee_targets(clear_positions=False)
+
+        created = 0
+        for site_name in sites[:8]:
+            try:
+                if reset_to_current:
+                    pos, quat = self._get_site_or_body_pose(site_name)
+                else:
+                    pos = self.ee_target_positions.get(site_name)
+                    quat = self.ee_target_orientations.get(site_name)
+                    if pos is None or quat is None:
+                        pos_curr, quat_curr = self._get_site_or_body_pose(site_name)
+                        if pos is None:
+                            pos = pos_curr
+                        if quat is None:
+                            quat = quat_curr
+                pos = np.asarray(pos, dtype=np.float64)
+                quat = np.asarray(quat, dtype=np.float64)
+                qn = float(np.linalg.norm(quat))
+                if qn > 1e-12:
+                    quat = quat / qn
+                else:
+                    quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            except Exception as exc:
+                print(f"[Viser][IK] Skip target for {site_name}: {exc}", flush=True)
+                continue
+
+            handle = self.server.scene.add_transform_controls(
+                f"/ik_targets/{site_name}",
+                scale=0.18,
+                disable_rotations=False,
+                position=tuple(float(x) for x in pos),
+                wxyz=tuple(float(x) for x in quat),
+                visible=True,
+            )
+
+            @handle.on_update
+            def _(ev, sname=site_name) -> None:
+                target_pos = np.asarray(ev.target.position, dtype=np.float64)
+                target_quat = np.asarray(ev.target.wxyz, dtype=np.float64)
+                qn = float(np.linalg.norm(target_quat))
+                if qn > 1e-12:
+                    target_quat = target_quat / qn
+                else:
+                    target_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+                self.ee_target_positions[sname] = target_pos
+                self.ee_target_orientations[sname] = target_quat
+                self._sync_ik_target_sliders(sname, target_pos, target_quat)
+                if sname in self._updating_ik_target_handles:
+                    return
+                # Throttle live IK to keep UI responsive while dragging.
+                now = time.monotonic()
+                if now - self._last_live_ik_time < 0.06:
+                    return
+                self._last_live_ik_time = now
+                self._ik_to_targets(
+                    max_iters=14,
+                    tol=6e-3,
+                    quiet=True,
+                )
+
+            @handle.on_drag_end
+            def _(ev, sname=site_name) -> None:
+                target_pos = np.asarray(ev.target.position, dtype=np.float64)
+                target_quat = np.asarray(ev.target.wxyz, dtype=np.float64)
+                qn = float(np.linalg.norm(target_quat))
+                if qn > 1e-12:
+                    target_quat = target_quat / qn
+                else:
+                    target_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+                self.ee_target_positions[sname] = target_pos
+                self.ee_target_orientations[sname] = target_quat
+                self._sync_ik_target_sliders(sname, target_pos, target_quat)
+                self._ik_to_targets()
+
+            self.ee_target_handles[site_name] = handle
+            self.ee_target_positions[site_name] = pos.copy()
+            self.ee_target_orientations[site_name] = quat.copy()
+            self._sync_ik_target_sliders(site_name, pos, quat)
+            created += 1
+
+        print(f"[Viser][IK] Created {created} draggable EE target(s).", flush=True)
+
+    def _clear_ee_targets(self, *, clear_positions: bool = False) -> None:
+        """Remove all draggable IK target gizmos."""
+        for handle in self.ee_target_handles.values():
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self.ee_target_handles.clear()
+        if clear_positions:
+            self.ee_target_positions.clear()
+            self.ee_target_orientations.clear()
+
+    def _ik_to_targets(
+        self,
+        *,
+        max_iters: int = 80,
+        tol: float = 2e-3,
+        quiet: bool = False,
+    ) -> None:
+        """Solve IK to all active draggable EE targets in one joint optimization."""
+        if not self.ee_target_handles:
+            print("[Viser][IK] No active viewport targets. Press T first.", flush=True)
+            return
+
+        targets: List[Tuple[str, np.ndarray, np.ndarray]] = []
+        for site_name, handle in self.ee_target_handles.items():
+            target_pos = np.asarray(handle.position, dtype=np.float64)
+            target_quat = np.asarray(handle.wxyz, dtype=np.float64)
+            qn = float(np.linalg.norm(target_quat))
+            if qn > 1e-12:
+                target_quat = target_quat / qn
+            else:
+                target_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            targets.append((site_name, target_pos, target_quat))
+            self.ee_target_positions[site_name] = target_pos.copy()
+            self.ee_target_orientations[site_name] = target_quat.copy()
+
+        # Deterministic order helps reproduce behavior across runs.
+        targets.sort(key=lambda x: x[0])
+
+        results: List[Tuple[str, bool, float]] = []
+        with self.worker_lock:
+            cfg, posture_task, limits = self._ensure_mink_solver_state()
+            start_qpos = self.data.qpos.copy()
+            cfg.update(q=start_qpos.copy())
+            posture_task.set_target(cfg.q)
+
+            target_frames: List[Tuple[str, str, int, int, np.ndarray, np.ndarray]] = []
+            tasks: List[object] = []
+            for site_name, target_pos, target_quat in targets:
+                site_id = mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_SITE, site_name
+                )
+                body_id = -1
+                frame_type = "site"
+                if site_id < 0:
+                    body_id = mujoco.mj_name2id(
+                        self.model, mujoco.mjtObj.mjOBJ_BODY, site_name
+                    )
+                    if body_id < 0:
+                        results.append((site_name, False, float("inf")))
+                        continue
+                    frame_type = "body"
+
+                frame_task = mink.FrameTask(
+                    frame_name=site_name,
+                    frame_type=frame_type,
+                    position_cost=1.0,
+                    orientation_cost=self._ik_orientation_cost,
+                    lm_damping=1e-3,
+                )
+                frame_task.set_target(
+                    self._make_mink_target_pose(
+                        np.asarray(target_pos, dtype=np.float64),
+                        np.asarray(target_quat, dtype=np.float64),
+                    )
+                )
+                tasks.append(frame_task)
+                target_frames.append(
+                    (site_name, frame_type, site_id, body_id, target_pos, target_quat)
+                )
+
+            if tasks:
+                root_task = self._make_mink_root_lock_task(cfg)
+                if root_task is not None:
+                    tasks.append(root_task)
+                tasks.append(posture_task)
+
+                best_qpos = cfg.q.copy()
+                best_errors = np.full(len(target_frames), np.inf, dtype=np.float64)
+                best_pose_score = float("inf")
+                dt = 0.1
+
+                for _ in range(max_iters):
+                    cfg.update()
+                    curr_errors = np.empty(len(target_frames), dtype=np.float64)
+                    curr_rot_errors = np.empty(len(target_frames), dtype=np.float64)
+                    for i, (
+                        _name,
+                        _frame_type,
+                        site_id,
+                        body_id,
+                        target_pos,
+                        target_quat,
+                    ) in enumerate(target_frames):
+                        if site_id >= 0:
+                            curr_pos = (
+                                cfg.data.site(int(site_id))
+                                .xpos.copy()
+                                .astype(np.float64)
+                            )
+                            curr_mat = (
+                                cfg.data.site(int(site_id)).xmat.reshape(3, 3).copy()
+                            )
+                        else:
+                            curr_pos = (
+                                cfg.data.xpos[int(body_id)].copy().astype(np.float64)
+                            )
+                            curr_mat = cfg.data.xmat[int(body_id)].reshape(3, 3).copy()
+                        curr_errors[i] = float(
+                            np.linalg.norm(
+                                np.asarray(target_pos, dtype=np.float64) - curr_pos
+                            )
+                        )
+                        curr_quat = (
+                            R.from_matrix(curr_mat)
+                            .as_quat(scalar_first=True)
+                            .astype(np.float64)
+                        )
+                        rot_delta = R.from_quat(
+                            curr_quat, scalar_first=True
+                        ).inv() * R.from_quat(
+                            np.asarray(target_quat, dtype=np.float64), scalar_first=True
+                        )
+                        curr_rot_errors[i] = float(rot_delta.magnitude())
+
+                    max_err = float(np.max(curr_errors))
+                    max_rot_err = float(np.max(curr_rot_errors))
+                    pose_score = max_err + 0.25 * max_rot_err
+                    if pose_score < best_pose_score:
+                        best_pose_score = pose_score
+                        best_errors = curr_errors.copy()
+                        best_qpos = cfg.q.copy()
+                    if max_err <= tol and max_rot_err <= 0.12:
+                        break
+
+                    try:
+                        vel = mink.solve_ik(
+                            cfg,
+                            tasks,
+                            dt,
+                            solver="daqp",
+                            damping=1e-3,
+                            limits=limits,
+                        )
+                    except Exception:
+                        break
+
+                    vel_norm = float(np.linalg.norm(vel))
+                    if vel_norm > 20.0 and vel_norm > 1e-12:
+                        vel *= 20.0 / vel_norm
+                    cfg.integrate_inplace(vel, dt)
+
+                self.data.qpos[:] = best_qpos
+                self._forward()
+
+                for i, (
+                    site_name,
+                    _frame_type,
+                    _site_id,
+                    _body_id,
+                    _target_pos,
+                    _target_quat,
+                ) in enumerate(target_frames):
+                    err = float(best_errors[i])
+                    results.append((site_name, bool(err <= tol), err))
+            else:
+                print("[Viser][IK] No valid target frames to solve.", flush=True)
+
+            solved_qpos = self.data.qpos.copy()
+
+        self.worker.update_qpos(solved_qpos)
+        self.worker.request_state_data()
+
+        if not quiet:
+            result_txt = ", ".join(
+                f"{name}:{err:.3f}m{'*' if not ok else ''}" for name, ok, err in results
+            )
+            print(f"[Viser][IK] Target solve done ({result_txt})", flush=True)
+
+    def _build_mink_velocity_limits(self) -> Dict[str, float]:
+        """Build per-joint velocity limits for Mink."""
+        active_joint_names = set(self.joint_names)
+        velocity_limits: Dict[str, float] = {}
+        for jnt_id in range(self.model.njnt):
+            jnt_type = self.model.jnt_type[jnt_id]
+            if jnt_type not in (
+                mujoco.mjtJoint.mjJNT_HINGE,
+                mujoco.mjtJoint.mjJNT_SLIDE,
+            ):
+                continue
+            jname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id)
+            if not jname:
+                continue
+            velocity_limits[jname] = 6.0 if jname in active_joint_names else 0.0
+        return velocity_limits
+
+    def _ensure_mink_solver_state(self):
+        """Lazily initialize Mink solver state."""
+        if self._mink_configuration is None:
+            self._mink_configuration = mink.Configuration(self.model)
+        if self._mink_posture_task is None:
+            self._mink_posture_task = mink.PostureTask(self.model, cost=1e-3)
+        if self._mink_limits is None:
+            limits = [mink.ConfigurationLimit(self.model)]
+            velocity_limits = self._build_mink_velocity_limits()
+            if velocity_limits:
+                limits.append(mink.VelocityLimit(self.model, velocity_limits))
+            self._mink_limits = limits
+
+        return self._mink_configuration, self._mink_posture_task, self._mink_limits
+
+    def _make_mink_root_lock_task(self, cfg: object) -> Optional[object]:
+        """Create a root pose lock task to prevent floating-base drift during IK."""
+        if not self.has_floating_base or not self.config.root_body:
+            return None
+
+        try:
+            root_task = mink.FrameTask(
+                frame_name=self.config.root_body,
+                frame_type="body",
+                position_cost=20.0,
+                orientation_cost=20.0,
+                lm_damping=1e-3,
+            )
+            root_task.set_target(
+                cfg.get_transform_frame_to_world(self.config.root_body, "body")
+            )
+            return root_task
+        except Exception as exc:
+            if not self._mink_root_lock_warned:
+                print(f"[Viser][IK] Root lock unavailable: {exc}", flush=True)
+                self._mink_root_lock_warned = True
+            return None
+
+    def _solve_position_ik_mink(
+        self,
+        site_name: str,
+        target_pos: np.ndarray,
+        *,
+        target_wxyz: Optional[np.ndarray] = None,
+        max_iters: int = 80,
+        tol: float = 2e-3,
+    ) -> Tuple[bool, float]:
+        """Solve pose IK using Mink (QP-based differential IK)."""
+        site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+        body_id = -1
+        frame_type = "site"
+        if site_id < 0:
+            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, site_name)
+            if body_id < 0:
+                print(f"[Viser][IK] Unknown site/body: {site_name}", flush=True)
+                return False, float("inf")
+            frame_type = "body"
+
+        cfg, posture_task, limits = self._ensure_mink_solver_state()
+        start_qpos = self.data.qpos.copy()
+        cfg.update(q=start_qpos.copy())
+        posture_task.set_target(cfg.q)
+
+        frame_task = mink.FrameTask(
+            frame_name=site_name,
+            frame_type=frame_type,
+            position_cost=1.0,
+            orientation_cost=self._ik_orientation_cost
+            if target_wxyz is not None
+            else 0.0,
+            lm_damping=1e-3,
+        )
+        frame_task.set_target(
+            self._make_mink_target_pose(
+                np.asarray(target_pos, dtype=np.float64),
+                np.asarray(target_wxyz, dtype=np.float64)
+                if target_wxyz is not None
+                else None,
+            )
+        )
+        tasks = [frame_task]
+        root_task = self._make_mink_root_lock_task(cfg)
+        if root_task is not None:
+            tasks.append(root_task)
+        tasks.append(posture_task)
+
+        best_qpos = cfg.q.copy()
+        best_err = float("inf")
+        best_score = float("inf")
+        dt = 0.1
+
+        for _ in range(max_iters):
+            cfg.update()
+            if site_id >= 0:
+                curr_pos = cfg.data.site(site_name).xpos.copy().astype(np.float64)
+                curr_mat = cfg.data.site(site_name).xmat.reshape(3, 3).copy()
+            else:
+                curr_pos = cfg.data.xpos[body_id].copy().astype(np.float64)
+                curr_mat = cfg.data.xmat[body_id].reshape(3, 3).copy()
+            err_norm = float(
+                np.linalg.norm(np.asarray(target_pos, dtype=np.float64) - curr_pos)
+            )
+
+            rot_err = 0.0
+            if target_wxyz is not None:
+                curr_quat = (
+                    R.from_matrix(curr_mat)
+                    .as_quat(scalar_first=True)
+                    .astype(np.float64)
+                )
+                target_quat = np.asarray(target_wxyz, dtype=np.float64)
+                qn = float(np.linalg.norm(target_quat))
+                if qn > 1e-12:
+                    target_quat = target_quat / qn
+                else:
+                    target_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+                rot_delta = R.from_quat(
+                    curr_quat, scalar_first=True
+                ).inv() * R.from_quat(target_quat, scalar_first=True)
+                rot_err = float(rot_delta.magnitude())
+
+            score = err_norm + 0.25 * rot_err
+            if score < best_score:
+                best_score = score
+                best_err = err_norm
+                best_qpos = cfg.q.copy()
+            if err_norm <= tol and (target_wxyz is None or rot_err <= 0.12):
+                break
+
+            try:
+                vel = mink.solve_ik(
+                    cfg,
+                    tasks,
+                    dt,
+                    solver="daqp",
+                    damping=1e-3,
+                    limits=limits,
+                )
+            except Exception:
+                break
+
+            vel_norm = float(np.linalg.norm(vel))
+            if vel_norm > 20.0 and vel_norm > 1e-12:
+                vel *= 20.0 / vel_norm
+            cfg.integrate_inplace(vel, dt)
+
+        self.data.qpos[:] = best_qpos
+        self._forward()
+
+        if not np.isfinite(best_err):
+            self.data.qpos[:] = start_qpos
+            self._forward()
+            return False, float("inf")
+
+        return bool(best_err <= tol), best_err
+
     def _build_settings_panel(self) -> None:
         with self.server.gui.add_folder("⚙️ Settings"):
-            self.mirror_checked = self.server.gui.add_checkbox("Mirror", True)
-            self.rev_mirror_checked = self.server.gui.add_checkbox("Rev. Mirror", False)
-            self.physics_enabled = self.server.gui.add_checkbox("Enable Physics", True)
-            self.relative_frame_checked = self.server.gui.add_checkbox(
-                "Save in Robot Frame",
-                True,
-            )
-            self.collision_geom_checked = self.server.gui.add_checkbox(
-                "Show Collision Geoms",
-                False,
-            )
-            self.show_all_geoms = self.server.gui.add_checkbox(
-                "Show All Geoms",
-                False,
-            )
-            self.show_com_checked = self.server.gui.add_checkbox(
-                "Show Center of Mass",
-                self.config.show_com,  # Default from config
-            )
+            row1 = self.server.gui.add_columns(2, widths=(1.0, 1.0))
+            with row1[0]:
+                self.mirror_checked = self.server.gui.add_checkbox("Mirror", True)
+            with row1[1]:
+                self.rev_mirror_checked = self.server.gui.add_checkbox(
+                    "Rev. Mirror",
+                    False,
+                )
+
+            row2 = self.server.gui.add_columns(2, widths=(1.0, 1.0))
+            with row2[0]:
+                self.physics_enabled = self.server.gui.add_checkbox(
+                    "Enable Physics", True
+                )
+            with row2[1]:
+                self.relative_frame_checked = self.server.gui.add_checkbox(
+                    "Save in Robot Frame",
+                    True,
+                )
+
+            row3 = self.server.gui.add_columns(2, widths=(1.0, 1.0))
+            with row3[0]:
+                self.collision_geom_checked = self.server.gui.add_checkbox(
+                    "Show Collision Geoms",
+                    False,
+                )
+            with row3[1]:
+                self.show_all_geoms = self.server.gui.add_checkbox(
+                    "Show All Geoms",
+                    False,
+                )
+
+            row4 = self.server.gui.add_columns(2, widths=(1.0, 1.0))
+            with row4[0]:
+                self.show_com_checked = self.server.gui.add_checkbox(
+                    "Show Center of Mass",
+                    self.config.show_com,  # Default from config
+                )
+            with row4[1]:
+                self.server.gui.add_markdown("")
 
         @self.mirror_checked.on_update
         def _(ev: GuiEvent) -> None:
@@ -2847,7 +4037,7 @@ class ViserKeyframeEditor:
             if self.show_com_checked
             else self.config.show_com
         )
-        
+
         if show_com:
             # Create COM sphere if it doesn't exist
             if self._com_sphere is None:
@@ -2962,7 +4152,7 @@ def main() -> None:
             root_body=args.root_body,
             save_dir=args.save_dir,
         )
-    
+
     # Apply CLI flags
     if args.no_auto_floor:
         config.auto_inject_floor = False
@@ -2978,7 +4168,7 @@ def main() -> None:
         port = editor.server.get_port()
     except Exception:
         port = 8080
-    
+
     print(f"\n🚀 Keyframe Editor running!")
     print(f"   Open http://localhost:{port} in your browser\n")
 
@@ -2991,5 +4181,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

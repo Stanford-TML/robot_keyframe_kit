@@ -18,8 +18,8 @@ import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from .keyframe import Keyframe
 from .config import EditorConfig
+from .keyframe import Keyframe
 
 
 class SimWorker(threading.Thread):
@@ -27,7 +27,7 @@ class SimWorker(threading.Thread):
 
     Handles physics simulation in a background thread, using threading
     instead of Qt. Use the provided lock to synchronize with the UI thread.
-    
+
     NOTE: This is adapted from the original toddlerbot implementation.
     The sim/robot parameters have been replaced with raw MuJoCo model/data.
     """
@@ -79,7 +79,8 @@ class SimWorker(threading.Thread):
         self.joint_angles_to_update = default_joint_angles.copy()
 
         self.update_qpos_requested = False
-        self.qpos_to_update = model.qpos0.copy()
+        # Start from current data state (editor may initialize from model home keyframe).
+        self.qpos_to_update = data.qpos.copy()
 
         # Stepping state
         self.keyframe_test_counter = -1
@@ -101,80 +102,86 @@ class SimWorker(threading.Thread):
         self.body_ang_vel_replay: List[np.ndarray] = []
         self.site_pos_replay: List[np.ndarray] = []
         self.site_quat_replay: List[np.ndarray] = []
-        
+
         # Detect actuator types for proper control
         # MuJoCo actuator types: motor (torque), position, velocity, etc.
         # For motor-type actuators, we need to compute PD control ourselves
         self.actuator_is_motor: List[bool] = []
         self.actuator_joint_ids: List[int] = []
         self._detect_actuator_types()
-        
+
         # Index tracking for velocity extraction (matching toddlerbot approach)
         # motor_indices: indices of actuator-controlled joints in qpos/qvel
         # joint_indices: indices of UI-visible joints in qpos/qvel
         self.motor_indices: np.ndarray = np.array([], dtype=np.int32)
         self.joint_indices: np.ndarray = np.array([], dtype=np.int32)
-        self.q_start_idx: int = 0   # Offset for qpos (7 if floating base, 0 if fixed)
+        self.q_start_idx: int = 0  # Offset for qpos (7 if floating base, 0 if fixed)
         self.qd_start_idx: int = 0  # Offset for qvel (6 if floating base, 0 if fixed)
         self._compute_velocity_indices()
 
     def _detect_actuator_types(self) -> None:
         """Detect which actuators need manual PD control.
-        
+
         MuJoCo actuator transmission types:
         - mjTRN_JOINT (0): Direct joint actuation
         - mjTRN_JOINTINPARENT (1): Joint in parent frame
         - etc.
-        
+
         MuJoCo actuator dynamic types:
         - mjDYN_NONE (0): No dynamics (motor, general torque)
         - mjDYN_INTEGRATOR (1): Integrator
         - mjDYN_FILTER (2): Filter
         - mjDYN_FILTEREXACT (3): Exact filter
         - mjDYN_MUSCLE (4): Muscle model
-        
+
         For actuators with dyntype=0 and gaintype=0 (typical <motor> elements),
         ctrl directly sets torque. These need manual PD control.
-        
+
         For actuators with gaintype=1 (position control, like <position kp="...">),
         ctrl sets target position and MuJoCo handles the PD.
         """
         self.actuator_is_motor = []
         self.actuator_joint_ids = []
-        
+
         for act_id in range(self.model.nu):
             # Get actuator properties
             trntype = self.model.actuator_trntype[act_id]
             dyntype = self.model.actuator_dyntype[act_id]
             gaintype = self.model.actuator_gaintype[act_id]
-            
+
             # Check if this actuator directly controls torque (motor type)
             # Motor actuators have dyntype=0 and gaintype=0 (or fixed gain)
             # Position actuators have gaintype=1 or gainprm[0] > 0 for proportional gain
-            is_motor = (dyntype == 0 and gaintype == 0)
-            
+            is_motor = dyntype == 0 and gaintype == 0
+
             # Additional check: if gainprm[0] (kp) is large, it's likely position-controlled
             kp = self.model.actuator_gainprm[act_id, 0]
             if kp > 10:  # Position actuators typically have kp > 0
                 is_motor = False
-            
+
             self.actuator_is_motor.append(is_motor)
-            
+
             # Get the joint ID this actuator controls (for reading qpos/qvel)
             trnid = self.model.actuator_trnid[act_id, 0]
             self.actuator_joint_ids.append(trnid)
-        
+
         # Log detection results
         n_motor = sum(self.actuator_is_motor)
         n_pos = len(self.actuator_is_motor) - n_motor
         if n_motor > 0:
-            print(f"[SimWorker] Detected {n_motor} torque-controlled actuators (will use manual PD)", flush=True)
+            print(
+                f"[SimWorker] Detected {n_motor} torque-controlled actuators (will use manual PD)",
+                flush=True,
+            )
         if n_pos > 0:
-            print(f"[SimWorker] Detected {n_pos} position-controlled actuators (using MuJoCo PD)", flush=True)
+            print(
+                f"[SimWorker] Detected {n_pos} position-controlled actuators (using MuJoCo PD)",
+                flush=True,
+            )
 
     def _compute_velocity_indices(self) -> None:
         """Compute indices for extracting motor and joint velocities from qvel.
-        
+
         This follows the toddlerbot approach:
         - motor_indices: indices of actuator-controlled joints
         - joint_indices: indices of UI-visible joints (joint_names)
@@ -187,14 +194,14 @@ class SimWorker(threading.Thread):
             if self.model.jnt_type[jnt_id] == mujoco.mjtJoint.mjJNT_FREE:
                 has_free_joint = True
                 break
-        
+
         if has_free_joint:
-            self.q_start_idx = 7   # Skip [x,y,z,qw,qx,qy,qz]
+            self.q_start_idx = 7  # Skip [x,y,z,qw,qx,qy,qz]
             self.qd_start_idx = 6  # Skip [vx,vy,vz,wx,wy,wz]
         else:
             self.q_start_idx = 0
             self.qd_start_idx = 0
-        
+
         # Motor indices: from actuator_joint_ids (indices of actuated joints)
         # Need to convert joint IDs to qvel indices (relative to qd_start_idx)
         motor_idx_list = []
@@ -207,58 +214,63 @@ class SimWorker(threading.Thread):
                 if rel_idx >= 0:
                     motor_idx_list.append(rel_idx)
         self.motor_indices = np.array(motor_idx_list, dtype=np.int32)
-        
+
         # Joint indices: from joint_names (UI-visible joints)
         joint_idx_list = []
         for joint_name in self.joint_names:
-            joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+            joint_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
+            )
             if joint_id >= 0:
                 dof_adr = self.model.jnt_dofadr[joint_id]
                 rel_idx = dof_adr - self.qd_start_idx
                 if rel_idx >= 0:
                     joint_idx_list.append(rel_idx)
         self.joint_indices = np.array(joint_idx_list, dtype=np.int32)
-        
-        print(f"[SimWorker] Velocity indices: {len(self.motor_indices)} motors, {len(self.joint_indices)} joints", flush=True)
 
-    def _compute_pd_control(self, targets: np.ndarray, debug: bool = False) -> np.ndarray:
+        print(
+            f"[SimWorker] Velocity indices: {len(self.motor_indices)} motors, {len(self.joint_indices)} joints",
+            flush=True,
+        )
+
+    def _compute_pd_control(
+        self, targets: np.ndarray, debug: bool = False
+    ) -> np.ndarray:
         """Compute PD control for motor-type actuators.
-        
+
         For position-controlled actuators, just pass through the target.
-        For motor/torque actuators, compute: torque = kp * (target - q) - kd * qvel
-        
+        For motor/torque actuators, compute force in actuator space:
+        force = kp * (target_length - actuator_length) - kd * actuator_velocity.
+
         Args:
             targets: Target positions for all actuators.
             debug: If True, print debug info for first motor.
-            
+
         Returns:
             Control signals (torques for motors, positions for position actuators).
         """
         ctrl = targets.copy()
-        
+
         # Get PD gains from config
-        kp = getattr(self.config, 'kp', 12.0)
-        kd = getattr(self.config, 'kd', 0.5)
-        
+        kp = getattr(self.config, "kp", 12.0)
+        kd = getattr(self.config, "kd", 0.5)
+
         for i, is_motor in enumerate(self.actuator_is_motor):
             if is_motor:
-                # This is a motor actuator - compute PD torque
-                joint_id = self.actuator_joint_ids[i]
-                if joint_id >= 0:
-                    # Get joint's qpos index (accounting for free joints etc.)
-                    qpos_adr = self.model.jnt_qposadr[joint_id]
-                    qvel_adr = self.model.jnt_dofadr[joint_id]
-                    
-                    q = self.data.qpos[qpos_adr]
-                    qvel = self.data.qvel[qvel_adr]
-                    
-                    # PD control: torque = kp * (target - q) - kd * qvel
-                    error = targets[i] - q
-                    ctrl[i] = kp * error - kd * qvel
-                    
-                    if debug and i == 0:
-                        print(f"[PD] Motor 0: target={targets[i]:.4f}, q={q:.4f}, error={error:.4f}, torque={ctrl[i]:.4f}", flush=True)
-        
+                # For torque actuators, tracking in actuator-length space is robust to
+                # gear ratios and tendon transmissions.
+                actuator_len = float(self.data.actuator_length[i])
+                actuator_vel = float(self.data.actuator_velocity[i])
+                error = float(targets[i]) - actuator_len
+                ctrl[i] = kp * error - kd * actuator_vel
+
+                if debug and i == 0:
+                    print(
+                        f"[PD] Motor 0: target_len={targets[i]:.4f}, "
+                        f"len={actuator_len:.4f}, err={error:.4f}, force={ctrl[i]:.4f}",
+                        flush=True,
+                    )
+
         return ctrl
 
     # ----- Helper methods for raw MuJoCo -----
@@ -273,11 +285,11 @@ class SimWorker(threading.Thread):
 
     def _get_site_transform(self, name: str) -> np.ndarray:
         """Get 4x4 transformation matrix for a site or body.
-        
+
         First tries to find a site with the given name, then falls back to body.
         """
         transformation = np.eye(4)
-        
+
         # Try site first
         try:
             site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, name)
@@ -289,7 +301,7 @@ class SimWorker(threading.Thread):
                 return transformation
         except Exception:
             pass
-        
+
         # Fall back to body
         try:
             body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
@@ -301,7 +313,7 @@ class SimWorker(threading.Thread):
                 return transformation
         except Exception:
             pass
-        
+
         raise ValueError(f"Could not find site or body named '{name}'")
 
     def _get_joint_angles(self) -> Dict[str, float]:
@@ -313,11 +325,17 @@ class SimWorker(threading.Thread):
 
     def _get_joint_angles_array(self) -> np.ndarray:
         """Get current joint angles as an array."""
-        return np.array([self.data.joint(name).qpos.item() for name in self.joint_names], dtype=np.float32)
+        return np.array(
+            [self.data.joint(name).qpos.item() for name in self.joint_names],
+            dtype=np.float32,
+        )
 
     def _get_actuator_values_array(self) -> np.ndarray:
         """Get current actuator positions as an array."""
-        return np.array([self.data.actuator(name).length.item() for name in self.actuator_names], dtype=np.float32)
+        return np.array(
+            [self.data.actuator(name).length.item() for name in self.actuator_names],
+            dtype=np.float32,
+        )
 
     def _set_joint_angles(self, joint_angles: Dict[str, float]) -> None:
         """Set joint angles from a dictionary."""
@@ -353,20 +371,20 @@ class SimWorker(threading.Thread):
 
     def _discover_end_effector_sites(self) -> List[str]:
         """Auto-discover end-effector sites by finding leaf bodies (bodies with no children).
-        
+
         In a kinematic chain, end effectors are the terminal links that have no child bodies.
         This method finds all leaf bodies and returns the sites attached to them, excluding
         internal constraint sites (group >= 3 or referenced in equality constraints).
         """
         # Find all body parent IDs to identify which bodies have children
         parent_ids = set(self.model.body_parentid)
-        
+
         # Find leaf bodies (bodies that are NOT parents of any other body)
         leaf_body_ids = []
         for body_id in range(self.model.nbody):
             if body_id not in parent_ids:
                 leaf_body_ids.append(body_id)
-        
+
         # Build set of sites referenced in equality CONNECT constraints (internal constraint points)
         equality_site_ids = set()
         for eq_id in range(self.model.neq):
@@ -374,80 +392,111 @@ class SimWorker(threading.Thread):
                 # For CONNECT constraints, obj1id and obj2id are site IDs
                 equality_site_ids.add(self.model.eq_obj1id[eq_id])
                 equality_site_ids.add(self.model.eq_obj2id[eq_id])
-        
+
         # End-effector keywords to identify legitimate end-effector sites even with high group numbers
-        ee_keywords = ["foot", "hand", "gripper", "ee", "end_effector", "tip", "toe", "palm"]
-        
+        ee_keywords = [
+            "foot",
+            "hand",
+            "gripper",
+            "ee",
+            "end_effector",
+            "tip",
+            "toe",
+            "palm",
+        ]
+
         # For each leaf body, look for attached sites
         ee_sites = []
         for body_id in leaf_body_ids:
             body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
             if body_name is None or body_name == "world":
                 continue
-            
+
             # Find sites attached to this body
             for site_id in range(self.model.nsite):
                 if self.model.site_bodyid[site_id] == body_id:
-                    site_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_SITE, site_id)
+                    site_name = mujoco.mj_id2name(
+                        self.model, mujoco.mjtObj.mjOBJ_SITE, site_id
+                    )
                     if not site_name:
                         continue
-                    
+
                     # Filter 1: Always exclude sites referenced in equality CONNECT constraints
                     if site_id in equality_site_ids:
                         continue
-                    
+
                     # Filter 2: Exclude sites with group >= 3 UNLESS they have end-effector-like names
                     site_lower = site_name.lower()
                     is_ee_like = any(kw in site_lower for kw in ee_keywords)
-                    
+
                     if self.model.site_group[site_id] >= 3 and not is_ee_like:
                         continue
-                    
+
                     ee_sites.append(site_name)
-        
+
         # If no sites found, fall back to leaf body names
         if not ee_sites:
-            ee_keywords = ["foot", "hand", "calf", "leg", "lleg", "ankle", "toe", "gripper"]
+            ee_keywords = [
+                "foot",
+                "hand",
+                "calf",
+                "leg",
+                "lleg",
+                "ankle",
+                "toe",
+                "gripper",
+            ]
             for body_id in leaf_body_ids:
-                body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+                body_name = mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_BODY, body_id
+                )
                 if body_name is None or body_name == "world":
                     continue
                 # Check if body name contains any end-effector keywords
                 body_lower = body_name.lower()
                 if any(kw in body_lower for kw in ee_keywords):
                     ee_sites.append(body_name)
-            
+
             # If still no matches, just use all leaf bodies
             if not ee_sites:
                 for body_id in leaf_body_ids:
-                    body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+                    body_name = mujoco.mj_id2name(
+                        self.model, mujoco.mjtObj.mjOBJ_BODY, body_id
+                    )
                     if body_name and body_name != "world":
                         ee_sites.append(body_name)
-        
+
         return ee_sites
 
     def _get_lowest_geom_z(self) -> float:
-        """Find the lowest z-coordinate of any collision geometry in world frame.
-        
-        This accounts for geom positions, orientations, and sizes to find the
-        actual lowest point of the robot's collision geometry.
-        
-        Note: Mesh geoms are SKIPPED because their rbound (bounding sphere) 
-        massively overestimates the actual extent. Instead, we rely on 
-        primitive collision geoms (spheres, boxes, capsules) which are more
-        accurate for ground contact detection.
+        """Find the lowest z-coordinate of any contact-enabled primitive geom.
+
+        This accounts for geom positions and sizes to estimate the lowest point.
+        Only geoms participating in contact (contype/conaffinity non-zero) are
+        considered; visual-only geoms are ignored.
+
+        Note: Mesh geoms are skipped because rbound is a conservative sphere and
+        can significantly overestimate extent. If only mesh contact geoms exist,
+        this method returns inf and caller should use site-based fallback.
         """
         lowest_z = float("inf")
-        
+
         for geom_id in range(self.model.ngeom):
+            # Ignore purely visual geoms that never participate in collisions.
+            if (
+                int(self.model.geom_contype[geom_id]) == 0
+                and int(self.model.geom_conaffinity[geom_id]) == 0
+            ):
+                continue
+
             # Get geom type and size
             geom_type = self.model.geom_type[geom_id]
             geom_size = self.model.geom_size[geom_id]
-            
+
             # Get geom world position
             geom_pos = self.data.geom_xpos[geom_id]
             geom_z = geom_pos[2]
-            
+
             # Estimate the lowest point based on geom type
             # SKIP mesh geoms - their rbound is a bounding sphere which overestimates
             # For humanoids/robots, the actual foot contact is usually defined by
@@ -472,7 +521,7 @@ class SimWorker(threading.Thread):
                 half_z = geom_size[2]
                 lowest_z = min(lowest_z, geom_z - half_z)
             # Skip MESH, PLANE, HFIELD - mesh rbound overestimates, plane/hfield are ground
-        
+
         return lowest_z
 
     def request_on_ground(self):
@@ -480,25 +529,28 @@ class SimWorker(threading.Thread):
         with self.lock:
             if self.is_testing:
                 return
-            
+
             root_body = self.config.root_body
             torso_t_curr = self._get_body_transform(root_body)
-            
+
             # Find the lowest z-coordinate of any collision geometry
             # This is more accurate than just using site positions
             lowest_z = self._get_lowest_geom_z()
-            
+
             if lowest_z == float("inf"):
                 # Fallback to site-based detection
                 site_z_min = float("inf")
                 min_site = None
-                
+
                 sites_to_check = self.config.end_effector_sites
                 if sites_to_check is None:
                     sites_to_check = self._discover_end_effector_sites()
                     if sites_to_check:
-                        print(f"[Ground] Auto-discovered EE sites: {sites_to_check}", flush=True)
-                
+                        print(
+                            f"[Ground] Auto-discovered EE sites: {sites_to_check}",
+                            flush=True,
+                        )
+
                 for site_name in sites_to_check:
                     try:
                         curr_transform = self._get_site_transform(site_name)
@@ -511,15 +563,17 @@ class SimWorker(threading.Thread):
                 if min_site is None:
                     print("[Ground] No collision geometries or sites found", flush=True)
                     return
-                
+
                 lowest_z = site_z_min
-                print(f"[Ground] Using site {min_site} at z={lowest_z:.4f}m", flush=True)
-            
+                print(
+                    f"[Ground] Using site {min_site} at z={lowest_z:.4f}m", flush=True
+                )
+
             # Move the robot so the lowest point is at z=0
             dz = lowest_z
             aligned_torso_t = torso_t_curr.copy()
             aligned_torso_t[2, 3] -= dz
-            
+
             self.data.qpos[:3] = aligned_torso_t[:3, 3]
             self.data.qpos[3:7] = R.from_matrix(aligned_torso_t[:3, :3]).as_quat(
                 scalar_first=True
@@ -537,20 +591,40 @@ class SimWorker(threading.Thread):
         if self.on_state:
             self.on_state(motor_pos, joint_pos, qpos)
 
-    def request_keyframe_test(self, keyframe: Keyframe, dt: float):
+    def request_keyframe_test(
+        self,
+        keyframe: Keyframe,
+        dt: float,
+        *,
+        physics_enabled: bool = True,
+    ):
+        emit_state: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None
         with self.lock:
             if self.is_testing:
                 return
             self.keyframe_test_counter = -1
             self.traj_test_counter = -1
-            self.data.qpos = keyframe.qpos.copy()
+            self.data.qpos[:] = keyframe.qpos.copy()
             self.data.qvel[:] = 0
             self._forward()
-            # Store motor target for PD control (don't set ctrl directly for motor actuators)
-            self.keyframe_motor_target = keyframe.motor_pos.copy()
-            self.keyframe_test_dt = dt
-            self.keyframe_test_counter = 0
-            self.is_testing = True
+
+            if physics_enabled:
+                # Store motor target for PD control (don't set ctrl directly for motor actuators)
+                self.keyframe_motor_target = keyframe.motor_pos.copy()
+                self.keyframe_test_dt = dt
+                self.keyframe_test_counter = 0
+                self.is_testing = True
+            else:
+                # Kinematic test: just apply pose and notify UI immediately.
+                self.is_testing = False
+                self.keyframe_motor_target = None
+                emit_state = (
+                    self._get_actuator_values_array(),
+                    self._get_joint_angles_array(),
+                    self.data.qpos.copy(),
+                )
+        if emit_state is not None and self.on_state:
+            self.on_state(*emit_state)
 
     def request_trajectory_test(
         self,
@@ -572,7 +646,7 @@ class SimWorker(threading.Thread):
             self.keyframe_test_counter = -1
             self.traj_test_counter = -1
 
-            self.data.qpos = qpos_start.copy()
+            self.data.qpos[:] = qpos_start.copy()
             self.data.qvel[:] = 0
             self.data.ctrl[:] = 0
             self._forward()
@@ -615,7 +689,7 @@ class SimWorker(threading.Thread):
                     self.is_testing = False
                     self.keyframe_test_counter = -1
                     self.traj_test_counter = -1
-                    self.data.qpos = self.qpos_to_update.copy()
+                    self.data.qpos[:] = self.qpos_to_update.copy()
                     self._forward()
                     self.update_qpos_requested = False
                 time.sleep(0)  # yield
@@ -635,21 +709,32 @@ class SimWorker(threading.Thread):
                 continue
 
             if 0 <= self.keyframe_test_counter <= 100:
+                emit_state: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None
                 with self.lock:
                     if self.keyframe_test_counter == 100:
                         self.keyframe_test_counter = -1
                         self.is_testing = False
                         self.keyframe_motor_target = None
+                        # Publish final simulated state to keep sliders in sync.
+                        emit_state = (
+                            self._get_actuator_values_array(),
+                            self._get_joint_angles_array(),
+                            self.data.qpos.copy(),
+                        )
                     else:
                         # Run n_frames physics substeps per control step
-                        n_substeps = getattr(self.config, 'n_frames', 10)
+                        n_substeps = getattr(self.config, "n_frames", 10)
                         for _ in range(n_substeps):
                             # Compute PD control for motor actuators
                             if self.keyframe_motor_target is not None:
-                                ctrl = self._compute_pd_control(self.keyframe_motor_target)
+                                ctrl = self._compute_pd_control(
+                                    self.keyframe_motor_target
+                                )
                                 self.data.ctrl[:] = ctrl
                             self._step()
                         self.keyframe_test_counter += 1
+                if emit_state is not None and self.on_state:
+                    self.on_state(*emit_state)
                 time.sleep(self.keyframe_test_dt)
                 continue
 
@@ -748,11 +833,11 @@ class SimWorker(threading.Thread):
                         if self.traj_physics_enabled:
                             # With physics enabled, set control targets and step
                             # Run n_frames physics substeps per control step (like original code)
-                            n_substeps = getattr(self.config, 'n_frames', 10)
+                            n_substeps = getattr(self.config, "n_frames", 10)
                             for substep in range(n_substeps):
                                 # For position-controlled actuators, ctrl is the target position
                                 # For motor/torque actuators, we compute PD control manually
-                                do_debug = (current_counter == 0 and substep == 0)
+                                do_debug = current_counter == 0 and substep == 0
                                 ctrl = self._compute_pd_control(target, debug=do_debug)
                                 self.data.ctrl[:] = ctrl
                                 self._step()
@@ -764,11 +849,14 @@ class SimWorker(threading.Thread):
 
                     # Record
                     qpos_data = self.data.qpos.copy()
-                    
+
                     # Compute motor and joint velocities
                     # For qpos trajectory (no physics): use mj_differentiatePos
                     # For action trajectory with physics: use qvel directly
-                    if self.is_qpos_traj and current_counter < len(self.action_traj) - 1:
+                    if (
+                        self.is_qpos_traj
+                        and current_counter < len(self.action_traj) - 1
+                    ):
                         # Qpos trajectory: compute qvel from consecutive frames
                         current_qpos = self.action_traj[current_counter]
                         next_qpos = self.action_traj[current_counter + 1]
@@ -782,24 +870,32 @@ class SimWorker(threading.Thread):
                         )
                         # Extract motor and joint velocities from computed qvel
                         if len(self.motor_indices) > 0:
-                            motor_vel_data = qvel_computed[self.qd_start_idx + self.motor_indices].astype(np.float32)
+                            motor_vel_data = qvel_computed[
+                                self.qd_start_idx + self.motor_indices
+                            ].astype(np.float32)
                         else:
                             motor_vel_data = np.array([], dtype=np.float32)
                         if len(self.joint_indices) > 0:
-                            joint_vel_data = qvel_computed[self.qd_start_idx + self.joint_indices].astype(np.float32)
+                            joint_vel_data = qvel_computed[
+                                self.qd_start_idx + self.joint_indices
+                            ].astype(np.float32)
                         else:
                             joint_vel_data = np.array([], dtype=np.float32)
                     else:
                         # Action trajectory or last frame: use qvel from simulation
                         if len(self.motor_indices) > 0:
-                            motor_vel_data = self.data.qvel[self.qd_start_idx + self.motor_indices].astype(np.float32)
+                            motor_vel_data = self.data.qvel[
+                                self.qd_start_idx + self.motor_indices
+                            ].astype(np.float32)
                         else:
                             motor_vel_data = np.array([], dtype=np.float32)
                         if len(self.joint_indices) > 0:
-                            joint_vel_data = self.data.qvel[self.qd_start_idx + self.joint_indices].astype(np.float32)
+                            joint_vel_data = self.data.qvel[
+                                self.qd_start_idx + self.joint_indices
+                            ].astype(np.float32)
                         else:
                             joint_vel_data = np.array([], dtype=np.float32)
-                    
+
                     root_body = self.config.root_body
                     torso_rot = R.from_quat(
                         self.data.body(root_body).xquat.copy(), scalar_first=True
@@ -808,9 +904,7 @@ class SimWorker(threading.Thread):
 
                     if self.is_relative_frame:
                         body_pos_world = np.array(self.data.xpos, dtype=np.float32)
-                        body_quat_world = np.array(
-                            self.data.xquat, dtype=np.float32
-                        )
+                        body_quat_world = np.array(self.data.xquat, dtype=np.float32)
                         body_pos = []
                         body_quat = []
                         for i in range(self.model.nbody):
@@ -834,7 +928,7 @@ class SimWorker(threading.Thread):
                         )
                         body_lin_vel = r_inv.apply(body_lin_vel_world)
                         body_ang_vel = r_inv.apply(body_ang_vel_world)
-                        
+
                         # Record end-effector sites
                         site_pos = []
                         site_quat = []
@@ -853,12 +947,8 @@ class SimWorker(threading.Thread):
                     else:
                         body_pos = np.array(self.data.xpos, dtype=np.float32)
                         body_quat = np.array(self.data.xquat, dtype=np.float32)
-                        body_lin_vel = np.array(
-                            self.data.cvel[:, 3:], dtype=np.float32
-                        )
-                        body_ang_vel = np.array(
-                            self.data.cvel[:, :3], dtype=np.float32
-                        )
+                        body_lin_vel = np.array(self.data.cvel[:, 3:], dtype=np.float32)
+                        body_ang_vel = np.array(self.data.cvel[:, :3], dtype=np.float32)
                         site_pos = []
                         site_quat = []
                         if self.config.end_effector_sites:
@@ -882,8 +972,16 @@ class SimWorker(threading.Thread):
                 self.body_quat_replay.append(body_quat)
                 self.body_lin_vel_replay.append(body_lin_vel)
                 self.body_ang_vel_replay.append(body_ang_vel)
-                self.site_pos_replay.append(np.array(site_pos, dtype=np.float32) if site_pos else np.array([], dtype=np.float32))
-                self.site_quat_replay.append(np.array(site_quat, dtype=np.float32) if site_quat else np.array([], dtype=np.float32))
+                self.site_pos_replay.append(
+                    np.array(site_pos, dtype=np.float32)
+                    if site_pos
+                    else np.array([], dtype=np.float32)
+                )
+                self.site_quat_replay.append(
+                    np.array(site_quat, dtype=np.float32)
+                    if site_quat
+                    else np.array([], dtype=np.float32)
+                )
 
                 self.traj_test_counter += 1
                 try:
@@ -907,5 +1005,3 @@ class SimWorker(threading.Thread):
                 continue
 
             time.sleep(0.005)
-
-

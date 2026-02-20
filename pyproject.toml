@@ -29,6 +29,7 @@ classifiers = [
 
 dependencies = [
     "mujoco==3.3.4",
+    "mink==0.0.13",
     "viser-keyframe==1.0.18",
     "numpy",
     "scipy",

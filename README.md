@@ -159,6 +159,7 @@ keyframe-editor robot.xml --generate-config config.yaml
 - **Physics Simulation**: Test keyframes and trajectories with full MuJoCo physics
 - **Ground Placement**: Automatically places robot on ground based on lowest collision geometry
 - **End-Effector Tracking**: Auto-detects and tracks end-effector sites/bodies
+- **Mink IK Solver**: QP-based IK for end-effector target solving
 
 
 ## Python API
