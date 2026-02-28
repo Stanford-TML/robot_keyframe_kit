@@ -3043,6 +3043,7 @@ class ViserKeyframeEditor:
         ee_keywords = [
             "foot",
             "hand",
+            "wrist",
             "gripper",
             "ee",
             "end_effector",
@@ -3080,11 +3081,61 @@ class ViserKeyframeEditor:
 
                     ee_sites.append(site_name)
 
+        # Some models (for example Unitree G1 scene.xml) expose hand endpoints as
+        # leaf wrist bodies but do not define dedicated hand sites. Likewise, some
+        # models only expose feet as leaf bodies. Supplement whichever category
+        # (arm/leg) is currently missing.
+        arm_ee_keywords = [
+            "hand",
+            "wrist",
+            "gripper",
+            "palm",
+            "finger",
+            "thumb",
+            "ee",
+            "end_effector",
+        ]
+        leg_ee_keywords = [
+            "foot",
+            "ankle",
+            "toe",
+            "heel",
+            "leg",
+            "calf",
+            "shin",
+        ]
+        has_arm_like_entry = any(
+            any(kw in entry.lower() for kw in arm_ee_keywords) for entry in ee_sites
+        )
+        has_leg_like_entry = any(
+            any(kw in entry.lower() for kw in leg_ee_keywords) for entry in ee_sites
+        )
+        if not has_arm_like_entry or not has_leg_like_entry:
+            existing = {entry.lower() for entry in ee_sites}
+            for body_id in leaf_body_ids:
+                body_name = mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_BODY, body_id
+                )
+                if body_name is None or body_name == "world":
+                    continue
+                body_lower = body_name.lower()
+                arm_match = (not has_arm_like_entry) and any(
+                    kw in body_lower for kw in arm_ee_keywords
+                )
+                leg_match = (not has_leg_like_entry) and any(
+                    kw in body_lower for kw in leg_ee_keywords
+                )
+                if arm_match or leg_match:
+                    if body_lower not in existing:
+                        ee_sites.append(body_name)
+                        existing.add(body_lower)
+
         # If no sites found, fall back to leaf body names
         if not ee_sites:
             body_ee_keywords = [
                 "foot",
                 "hand",
+                "wrist",
                 "calf",
                 "leg",
                 "lleg",
