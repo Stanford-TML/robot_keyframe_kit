@@ -3304,48 +3304,22 @@ class ViserKeyframeEditor:
             with self.server.gui.add_folder(
                 short_name, expand_by_default=False
             ) as target_folder:
-                x_slider = self.server.gui.add_slider(
-                    "X (m)",
-                    min=-3.0,
-                    max=3.0,
-                    step=0.005,
-                    initial_value=float(initial_pos[0]),
-                )
-                y_slider = self.server.gui.add_slider(
-                    "Y (m)",
-                    min=-3.0,
-                    max=3.0,
-                    step=0.005,
-                    initial_value=float(initial_pos[1]),
-                )
-                z_slider = self.server.gui.add_slider(
-                    "Z (m)",
-                    min=-0.2,
-                    max=2.5,
-                    step=0.005,
-                    initial_value=float(initial_pos[2]),
-                )
-                roll_slider = self.server.gui.add_slider(
-                    "Roll (rad)",
-                    min=-3.14159,
-                    max=3.14159,
-                    step=0.01,
-                    initial_value=float(roll0),
-                )
-                pitch_slider = self.server.gui.add_slider(
-                    "Pitch (rad)",
-                    min=-3.14159,
-                    max=3.14159,
-                    step=0.01,
-                    initial_value=float(pitch0),
-                )
-                yaw_slider = self.server.gui.add_slider(
-                    "Yaw (rad)",
-                    min=-3.14159,
-                    max=3.14159,
-                    step=0.01,
-                    initial_value=float(yaw0),
-                )
+                def _safe_slider(label, lo, hi, step, val):
+                    """Create slider with range expanded to fit initial value."""
+                    return self.server.gui.add_slider(
+                        label,
+                        min=min(lo, val),
+                        max=max(hi, val),
+                        step=step,
+                        initial_value=val,
+                    )
+
+                x_slider = _safe_slider("X (m)", -3.0, 3.0, 0.005, float(initial_pos[0]))
+                y_slider = _safe_slider("Y (m)", -3.0, 3.0, 0.005, float(initial_pos[1]))
+                z_slider = _safe_slider("Z (m)", -0.2, 2.5, 0.005, float(initial_pos[2]))
+                roll_slider = _safe_slider("Roll (rad)", -3.14159, 3.14159, 0.01, float(roll0))
+                pitch_slider = _safe_slider("Pitch (rad)", -3.14159, 3.14159, 0.01, float(pitch0))
+                yaw_slider = _safe_slider("Yaw (rad)", -3.14159, 3.14159, 0.01, float(yaw0))
                 self.ee_target_slider_widgets[site_name] = {
                     "x": x_slider,
                     "y": y_slider,
