@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import threading
 import time
@@ -87,6 +88,8 @@ class ViserKeyframeEditor:
         self.config = config
         self.xml_path = os.path.abspath(xml_path)
         self.dt = config.dt
+        self.root_pose_gizmo_scale = float(config.root_pose_gizmo_scale)
+        self.ik_target_gizmo_scale = float(config.ik_target_gizmo_scale)
 
         # Load MuJoCo model, ensuring it has a ground plane for physics
         self.model, self.data = self._load_model_with_ground(self.xml_path)
@@ -142,6 +145,7 @@ class ViserKeyframeEditor:
         self.data.qpos[:] = self.home_qpos.copy()
         self.data.qvel[:] = 0
         mujoco.mj_forward(self.model, self.data)
+        self._apply_model_based_gizmo_scale()
 
         # Set up save directory: {save_dir}/{name}/
         # Files will be saved as {motion_name}_{timestamp}.lz4
@@ -189,7 +193,10 @@ class ViserKeyframeEditor:
 
         # Scene bookkeeping
         self._geom_handles: Dict[int, object] = {}
+        self._geom_fade_handles: Dict[int, object] = {}
         self._geom_groups: Dict[int, int] = {}
+        self._geom_body_ids: Dict[int, int] = {}
+        self._body_geom_indices: Dict[int, List[int]] = {}
         self._geom_base_rgba: Dict[int, Tuple[float, float, float, float]] = {}
         self._scene_handles: Dict[str, object] = {}
         self._mesh_file_map: Dict[str, str] = {}
@@ -197,6 +204,10 @@ class ViserKeyframeEditor:
         self._mesh_quat_map: Dict[str, Tuple[float, float, float, float]] = {}
         self._com_sphere: Optional[object] = None
         self._scene_updater: Optional[threading.Thread] = None
+        scene_hz = max(
+            15.0, min(120.0, float(getattr(config, "scene_update_hz", 60.0)))
+        )
+        self._scene_update_dt = 1.0 / scene_hz
 
         # GUI bookkeeping
         self.slider_widgets: Dict[str, viser.GuiSliderHandle] = {}
@@ -205,9 +216,11 @@ class ViserKeyframeEditor:
         self.show_com_checked: Optional[viser.GuiCheckboxHandle] = None
         self.motion_name_input: Optional[viser.GuiTextHandle] = None
         self.keyframes_summary: Optional[viser.GuiHtmlHandle] = None
+        self.keyframes_list_widget: Optional[object] = None
         self.keyframe_index_input: Optional[viser.GuiTextHandle] = None
         self.keyframe_name_input: Optional[viser.GuiTextHandle] = None
         self.sequence_summary: Optional[viser.GuiHtmlHandle] = None
+        self.sequence_list_widget: Optional[object] = None
         self.sequence_index_input: Optional[viser.GuiTextHandle] = None
         self.sequence_time_input: Optional[viser.GuiTextHandle] = None
         self.mirror_checked: Optional[viser.GuiCheckboxHandle] = None
@@ -223,6 +236,7 @@ class ViserKeyframeEditor:
         self._mink_posture_task = None
         self._mink_limits = None
         self._mink_root_lock_warned = False
+        self._gizmo_fade_alpha = 0.33
 
         # Lock shared between geometry updates and worker callbacks
         self.worker_lock = threading.Lock()
@@ -231,7 +245,7 @@ class ViserKeyframeEditor:
         self.server = viser.ViserServer(label="Keyframe Editor")
         try:
             self.server.gui.configure_theme(
-                control_layout="fixed",
+                control_layout="floating",
                 control_width="small",
             )
         except Exception as exc:
@@ -264,11 +278,7 @@ class ViserKeyframeEditor:
                 if bool(getattr(event, "repeat", False)):
                     return
                 key = str(getattr(event, "key", "")).lower()
-                if (
-                    key == "r"
-                    and self.has_floating_base
-                    and self.root_pose_gizmo_checked is not None
-                ):
+                if key == "r" and self.has_floating_base:
                     self._toggle_root_gizmo_checkbox()
                     return
                 if key == "t":
@@ -418,6 +428,26 @@ class ViserKeyframeEditor:
                 self.data.qvel[:] = prev_qvel
                 mujoco.mj_forward(self.model, self.data)
         return motor_pos
+
+    def _get_joint_pos_from_qpos(self, qpos: np.ndarray) -> np.ndarray:
+        """Compute slider-space joint values from a given qpos.
+
+        Uses current `self.joint_names` ordering so legacy motion files with
+        different stored `joint_pos` ordering still load correctly.
+        """
+        qpos_arr = np.asarray(qpos, dtype=np.float64)
+        joint_pos: List[float] = []
+        for jname in self.joint_names:
+            try:
+                jnt_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+                if jnt_id < 0:
+                    joint_pos.append(0.0)
+                    continue
+                qpos_adr = int(self.model.jnt_qposadr[jnt_id])
+                joint_pos.append(float(qpos_arr[qpos_adr]))
+            except Exception:
+                joint_pos.append(0.0)
+        return np.asarray(joint_pos, dtype=np.float32)
 
     def _has_floating_base(self) -> bool:
         """Check if robot has a floating base (freejoint on root body).
@@ -1267,12 +1297,74 @@ class ViserKeyframeEditor:
         """Run forward kinematics."""
         mujoco.mj_forward(self.model, self.data)
 
+    def _estimate_robot_height(self) -> float:
+        """Estimate robot height from geom bounds in the current model state."""
+        mins = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
+        maxs = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
+        used = 0
+
+        for geom_id in range(self.model.ngeom):
+            # Ignore world geoms (often floor/environment).
+            if int(self.model.geom_bodyid[geom_id]) == 0:
+                continue
+            # Ignore infinite planes.
+            if int(self.model.geom_type[geom_id]) == int(mujoco.mjtGeom.mjGEOM_PLANE):
+                continue
+
+            radius = float(self.model.geom_rbound[geom_id])
+            if (not np.isfinite(radius)) or radius <= 0.0:
+                size = np.asarray(self.model.geom_size[geom_id], dtype=np.float64)
+                if np.isfinite(size).all():
+                    radius = float(np.linalg.norm(size))
+                else:
+                    radius = 0.0
+            if radius <= 0.0:
+                continue
+
+            center = np.asarray(self.data.geom_xpos[geom_id], dtype=np.float64)
+            mins = np.minimum(mins, center - radius)
+            maxs = np.maximum(maxs, center + radius)
+            used += 1
+
+        if used == 0:
+            return 1.0
+
+        extents = maxs - mins
+        height = float(extents[2])
+        if (not np.isfinite(height)) or height <= 1e-6:
+            return 1.0
+        return height
+
+    def _compute_model_gizmo_scale_factor(self) -> float:
+        """Compute global gizmo scale factor from model size and config knobs."""
+        ratio = max(0.0, float(self.config.gizmo_scale_ratio))
+        if not bool(self.config.auto_scale_gizmos):
+            return ratio
+
+        ref_height = max(1e-6, float(self.config.gizmo_reference_height))
+        model_height = self._estimate_robot_height()
+        auto_factor = float(np.clip(model_height / ref_height, 0.35, 1.8))
+        return ratio * auto_factor
+
+    def _apply_model_based_gizmo_scale(self) -> None:
+        """Scale gizmo sizes based on model size and config."""
+        factor = self._compute_model_gizmo_scale_factor()
+        self.root_pose_gizmo_scale *= factor
+        self.ik_target_gizmo_scale *= factor
+        print(
+            "[Viser] Gizmo scale factor: "
+            f"{factor:.3f} (root={self.root_pose_gizmo_scale:.3f}, "
+            f"ik={self.ik_target_gizmo_scale:.3f})",
+            flush=True,
+        )
+
     # -- GUI helpers --
 
     def _build_ui(self) -> None:
         """Construct the three-column GUI layout (controls + joint sliders)."""
         left_joints, right_joints = self._split_joint_lists()
         ee_sites = self._get_ee_sites_for_panels()
+
         columns_handle: Optional[viser.GuiColumnsHandle]
         try:
             columns_handle = self.server.gui.add_columns(
@@ -1390,6 +1482,78 @@ class ViserKeyframeEditor:
                         self.worker.is_testing = False
 
     def _build_keyframe_sequence_panels(self) -> None:
+        supports_gui_list = hasattr(self.server.gui, "add_list")
+
+        if supports_gui_list and self.keyframes_list_widget is None:
+            with self.server.gui.add_folder("Keyframes List"):
+                self.keyframes_list_widget = self.server.gui.add_list(
+                    "",
+                    (),
+                    initial_selected_index=-1,
+                    allow_rename=True,
+                    allow_reorder=True,
+                    max_visible_rows=10,
+                    hint="Click to select, double-click to rename, drag to reorder.",
+                )
+
+                @self.keyframes_list_widget.on_update
+                def _(ev: GuiEvent) -> None:
+                    if id(ev.target) in self._updating_handles:
+                        return
+                    payload = self._as_list_event_payload(self.keyframes_list_widget)
+                    event = str(payload.get("event", "select"))
+                    selected = self._payload_index(payload.get("selected_index"))
+                    if event == "rename":
+                        idx = self._payload_index(
+                            payload.get("index"), fallback=selected
+                        )
+                        text = str(payload.get("text", "")).strip()
+                        self._rename_keyframe(idx, text)
+                    elif event == "reorder":
+                        src_idx = self._payload_index(payload.get("src_index"))
+                        dst_idx = self._payload_index(payload.get("dst_index"))
+                        self._reorder_keyframe(src_idx, dst_idx)
+                    elif 0 <= selected < len(self.keyframes):
+                        self._load_keyframe_to_ui(selected)
+
+        if supports_gui_list and self.sequence_list_widget is None:
+            with self.server.gui.add_folder("Sequence List"):
+                self.sequence_list_widget = self.server.gui.add_list(
+                    "",
+                    (),
+                    initial_selected_index=-1,
+                    allow_rename=True,
+                    allow_reorder=True,
+                    max_visible_rows=10,
+                    hint="Click to select, drag to reorder, double-click to edit arrival time.",
+                )
+
+                @self.sequence_list_widget.on_update
+                def _(ev: GuiEvent) -> None:
+                    if id(ev.target) in self._updating_handles:
+                        return
+                    payload = self._as_list_event_payload(self.sequence_list_widget)
+                    event = str(payload.get("event", "select"))
+                    selected = self._payload_index(payload.get("selected_index"))
+                    if event == "reorder":
+                        src_idx = self._payload_index(payload.get("src_index"))
+                        dst_idx = self._payload_index(payload.get("dst_index"))
+                        self._reorder_sequence(src_idx, dst_idx)
+                    elif event == "rename":
+                        idx = self._payload_index(
+                            payload.get("index"), fallback=selected
+                        )
+                        new_time = self._parse_sequence_time_text(
+                            str(payload.get("text", ""))
+                        )
+                        if new_time is not None:
+                            self._edit_sequence_time(idx, new_time)
+                    elif 0 <= selected < len(self.sequence_list):
+                        self.selected_sequence = selected
+
+        if supports_gui_list:
+            return
+
         if self.keyframes_summary is None:
             with self.server.gui.add_folder("Keyframes List"):
                 self.keyframes_summary = self.server.gui.add_html("No keyframes")
@@ -1443,18 +1607,7 @@ class ViserKeyframeEditor:
                     ):
                         return
                     new_name = str(self.keyframe_name_input.value).strip()
-                    if not new_name:
-                        return
-                    for i, kf in enumerate(self.keyframes):
-                        if i != self.selected_keyframe and kf.name == new_name:
-                            return
-                    old_name = self.keyframes[self.selected_keyframe].name
-                    self.keyframes[self.selected_keyframe].name = new_name
-                    for i, (n, t) in enumerate(self.sequence_list):
-                        if n == old_name:
-                            self.sequence_list[i] = (new_name, t)
-                    self._refresh_keyframes_summary()
-                    self._refresh_sequence_summary()
+                    self._rename_keyframe(self.selected_keyframe, new_name)
 
         if self.sequence_summary is None:
             with self.server.gui.add_folder("Sequence List"):
@@ -1496,7 +1649,7 @@ class ViserKeyframeEditor:
                         return
                     if 0 <= idx < len(self.sequence_list):
                         self.selected_sequence = idx
-                        name, t = self.sequence_list[idx]
+                        _, t = self.sequence_list[idx]
                         self._set_handle_value(self.sequence_time_input, f"{float(t)}")
 
                 @self.sequence_time_input.on_update
@@ -1511,6 +1664,120 @@ class ViserKeyframeEditor:
                     except Exception:
                         return
                     self._edit_sequence_time(self.selected_sequence, new_t)
+
+    def _as_list_event_payload(self, handle: object) -> Dict[str, object]:
+        """Return a normalized dictionary payload from a GuiList handle value."""
+        raw = getattr(handle, "value", None)
+        if isinstance(raw, dict):
+            return dict(raw)
+        return {}
+
+    def _payload_index(self, value: object, fallback: int = -1) -> int:
+        """Parse a list payload index safely."""
+        try:
+            return int(value)
+        except Exception:
+            return fallback
+
+    def _parse_sequence_time_text(self, text: str) -> Optional[float]:
+        """Parse an arrival-time value from inline sequence list editing."""
+        stripped = text.strip()
+        if not stripped:
+            return None
+        try:
+            return float(stripped)
+        except Exception:
+            matches = re.findall(
+                r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?",
+                stripped,
+            )
+            if not matches:
+                return None
+            try:
+                # Prefer the last numeric token (handles names like down_1 | t=3.0s).
+                return float(matches[-1])
+            except Exception:
+                return None
+
+    def _format_sequence_time_display(self, t: float) -> str:
+        """Format sequence time for UI display with trimmed trailing zeros.
+
+        Examples:
+            0.0 -> "0.0"
+            1.0 -> "1.0"
+            5.5 -> "5.5"
+            7.55 -> "7.55"
+            8.50 -> "8.5"
+        """
+        value = float(t)
+        if abs(value) < 1e-12:
+            value = 0.0
+        text = f"{value:.6f}".rstrip("0").rstrip(".")
+        if "." not in text:
+            text = f"{text}.0"
+        return text
+
+    def _rename_keyframe(self, idx: int, new_name: str) -> None:
+        """Rename a keyframe while preserving sequence references."""
+        if not (0 <= idx < len(self.keyframes)):
+            return
+        new_name = new_name.strip().replace(" ", "_")
+        if not new_name:
+            return
+        for i, kf in enumerate(self.keyframes):
+            if i != idx and kf.name == new_name:
+                return
+        old_name = self.keyframes[idx].name
+        if old_name == new_name:
+            return
+        self.keyframes[idx].name = new_name
+        for i, (n, t) in enumerate(self.sequence_list):
+            if n == old_name:
+                self.sequence_list[i] = (new_name, t)
+        self._refresh_keyframes_summary()
+        self._refresh_sequence_summary()
+
+    def _reorder_keyframe(self, src_idx: int, dst_idx: int) -> None:
+        """Move a keyframe to a specific index."""
+        if src_idx == dst_idx:
+            return
+        if not (0 <= src_idx < len(self.keyframes)):
+            return
+        if not (0 <= dst_idx < len(self.keyframes)):
+            return
+
+        moved = self.keyframes.pop(src_idx)
+        self.keyframes.insert(dst_idx, moved)
+
+        if self.selected_keyframe is not None:
+            if self.selected_keyframe == src_idx:
+                self.selected_keyframe = dst_idx
+            elif src_idx < self.selected_keyframe <= dst_idx:
+                self.selected_keyframe -= 1
+            elif dst_idx <= self.selected_keyframe < src_idx:
+                self.selected_keyframe += 1
+        self._refresh_keyframes_table()
+
+    def _reorder_sequence(self, src_idx: int, dst_idx: int) -> None:
+        """Move a sequence row to a specific index."""
+        if src_idx == dst_idx:
+            return
+        if not (0 <= src_idx < len(self.sequence_list)):
+            return
+        if not (0 <= dst_idx < len(self.sequence_list)):
+            return
+
+        moved = self.sequence_list.pop(src_idx)
+        self.sequence_list.insert(dst_idx, moved)
+
+        if self.selected_sequence is not None:
+            if self.selected_sequence == src_idx:
+                self.selected_sequence = dst_idx
+            elif src_idx < self.selected_sequence <= dst_idx:
+                self.selected_sequence -= 1
+            elif dst_idx <= self.selected_sequence < src_idx:
+                self.selected_sequence += 1
+        self._refresh_sequence_table()
 
     def _get_mirror_partner(self, joint_name: str) -> Optional[str]:
         """Get the mirror partner for a joint name using various naming conventions."""
@@ -1573,8 +1840,9 @@ class ViserKeyframeEditor:
         if not self.has_floating_base or self.root_slider_widgets:
             return
 
-        current_pos = self.data.qpos[0:3].copy()
-        current_quat = self.data.qpos[3:7].copy()
+        with self.worker_lock:
+            current_pos = self.data.qpos[0:3].copy()
+            current_quat = self.data.qpos[3:7].copy()
         current_euler = self._quat_to_euler(current_quat)
 
         with self.server.gui.add_folder("Root Pose"):
@@ -1604,25 +1872,36 @@ class ViserKeyframeEditor:
             self.server.gui.add_markdown("_Orientation_")
             roll_slider = self.server.gui.add_slider(
                 "Roll (rad)",
-                min=-3.14159,
-                max=3.14159,
+                min=-3.14,
+                max=3.14,
                 step=0.01,
                 initial_value=float(current_euler[0]),
             )
             pitch_slider = self.server.gui.add_slider(
                 "Pitch (rad)",
-                min=-3.14159,
-                max=3.14159,
+                min=-3.14,
+                max=3.14,
                 step=0.01,
                 initial_value=float(current_euler[1]),
             )
             yaw_slider = self.server.gui.add_slider(
                 "Yaw (rad)",
-                min=-3.14159,
-                max=3.14159,
+                min=-3.14,
+                max=3.14,
                 step=0.01,
                 initial_value=float(current_euler[2]),
             )
+
+            for slider in (
+                x_slider,
+                y_slider,
+                z_slider,
+                roll_slider,
+                pitch_slider,
+                yaw_slider,
+            ):
+                slider.precision = 2
+                self._set_handle_value(slider, float(slider.value))
 
             self.root_pose_gizmo_checked = self.server.gui.add_checkbox(
                 "Root Pose Gizmo (R)",
@@ -1658,11 +1937,20 @@ class ViserKeyframeEditor:
 
     def _toggle_root_gizmo_checkbox(self) -> None:
         """Toggle the root gizmo checkbox and apply its callback path."""
-        if self.root_pose_gizmo_checked is None:
+        if not self.has_floating_base:
             return
-        enabled = not bool(self.root_pose_gizmo_checked.value)
-        self.root_pose_gizmo_checked.value = enabled
-        self._set_root_gizmo_enabled(enabled)
+        if self.root_pose_gizmo_checked is not None:
+            enabled = not bool(self.root_pose_gizmo_checked.value)
+            self.root_pose_gizmo_checked.value = enabled
+            self._set_root_gizmo_enabled(enabled)
+            return
+
+        # Sliders-only UI mode does not build the checkbox, so toggle directly.
+        currently_enabled = bool(
+            self.root_pose_gizmo is not None
+            and getattr(self.root_pose_gizmo, "visible", False)
+        )
+        self._set_root_gizmo_enabled(not currently_enabled)
 
     def _set_root_gizmo_enabled(self, enabled: bool) -> None:
         """Show/hide the viewport transform controls for root pose."""
@@ -1670,11 +1958,12 @@ class ViserKeyframeEditor:
             return
 
         if self.root_pose_gizmo is None:
-            root_pos = tuple(float(v) for v in self.data.qpos[0:3])
-            root_quat = tuple(float(v) for v in self.data.qpos[3:7])
+            with self.worker_lock:
+                root_pos = tuple(float(v) for v in self.data.qpos[0:3])
+                root_quat = tuple(float(v) for v in self.data.qpos[3:7])
             handle = self.server.scene.add_transform_controls(
                 "/root_pose_gizmo",
-                scale=0.35,
+                scale=self.root_pose_gizmo_scale,
                 disable_axes=False,
                 disable_sliders=False,
                 disable_rotations=False,
@@ -1708,6 +1997,7 @@ class ViserKeyframeEditor:
 
         if enabled:
             self._sync_root_gizmo_from_qpos()
+        self._apply_geom_visibility()
 
     def _sync_root_gizmo_from_qpos(self) -> None:
         """Sync root pose gizmo from current qpos values."""
@@ -1716,8 +2006,11 @@ class ViserKeyframeEditor:
 
         self._updating_root_gizmo = True
         try:
-            self.root_pose_gizmo.position = tuple(float(v) for v in self.data.qpos[0:3])
-            self.root_pose_gizmo.wxyz = tuple(float(v) for v in self.data.qpos[3:7])
+            with self.worker_lock:
+                pos = tuple(float(v) for v in self.data.qpos[0:3])
+                quat = tuple(float(v) for v in self.data.qpos[3:7])
+            self.root_pose_gizmo.position = pos
+            self.root_pose_gizmo.wxyz = quat
         finally:
             self._updating_root_gizmo = False
 
@@ -1737,18 +2030,20 @@ class ViserKeyframeEditor:
         yaw = float(self.root_slider_widgets["yaw"].value)
         quat = self._euler_to_quat(roll, pitch, yaw)
 
-        # Update qpos
-        self.data.qpos[0] = x
-        self.data.qpos[1] = y
-        self.data.qpos[2] = z
-        self.data.qpos[3:7] = quat
+        with self.worker_lock:
+            # Update qpos
+            self.data.qpos[0] = x
+            self.data.qpos[1] = y
+            self.data.qpos[2] = z
+            self.data.qpos[3:7] = quat
 
-        # Forward kinematics to update derived quantities
-        mujoco.mj_forward(self.model, self.data)
+            # Forward kinematics to update derived quantities
+            mujoco.mj_forward(self.model, self.data)
+            qpos_copy = self.data.qpos.copy()
         self._sync_root_gizmo_from_qpos()
 
         # Also update worker's data
-        self.worker.update_qpos(self.data.qpos.copy())
+        self.worker.update_qpos(qpos_copy)
 
     def _sync_root_sliders_from_qpos(self) -> None:
         """Sync root pose sliders from current qpos values."""
@@ -1756,8 +2051,9 @@ class ViserKeyframeEditor:
             return
 
         # Get current root pose from qpos
-        pos = self.data.qpos[0:3]
-        quat = self.data.qpos[3:7]
+        with self.worker_lock:
+            pos = self.data.qpos[0:3].copy()
+            quat = self.data.qpos[3:7].copy()
         euler = self._quat_to_euler(quat)
 
         # Update sliders without triggering callbacks
@@ -1810,15 +2106,15 @@ class ViserKeyframeEditor:
             initial_value=default_val,
         )
         self.slider_widgets[joint_name] = slider
-        slider.precision = 4
-        slider.value = round(float(slider.value), 4)
+        slider.precision = 2
+        slider.value = round(float(slider.value), 2)
 
         @slider.on_update
         def _(_event: GuiEvent, jname=joint_name, sld=slider) -> None:
             if id(sld) in self._updating_handles:
                 return
             try:
-                value = round(float(sld.value), 4)
+                value = round(float(sld.value), 2)
                 if sld.value != value:
                     self._set_handle_value(sld, value)
             except Exception:
@@ -1844,7 +2140,10 @@ class ViserKeyframeEditor:
             return
 
         self._geom_handles.clear()
+        self._geom_fade_handles.clear()
         self._geom_groups.clear()
+        self._geom_body_ids.clear()
+        self._body_geom_indices.clear()
         self._geom_base_rgba.clear()
         self._mesh_file_map.clear()
         self._mesh_scale_map.clear()
@@ -1997,6 +2296,11 @@ class ViserKeyframeEditor:
                 if hasattr(m, "geom_dataid")
                 else np.full(m.ngeom, -1, dtype=np.int32)
             )
+            geom_bodyid = (
+                np.array(m.geom_bodyid, dtype=np.int32)
+                if hasattr(m, "geom_bodyid")
+                else np.full(m.ngeom, -1, dtype=np.int32)
+            )
             geom_matid = (
                 np.array(m.geom_matid, dtype=np.int32)
                 if hasattr(m, "geom_matid")
@@ -2020,6 +2324,7 @@ class ViserKeyframeEditor:
             )
             geom_group = np.zeros(m.ngeom, dtype=np.int32)
             geom_dataid = np.full(m.ngeom, -1, dtype=np.int32)
+            geom_bodyid = np.full(m.ngeom, -1, dtype=np.int32)
             geom_matid = np.full(m.ngeom, -1, dtype=np.int32)
             mat_rgba = None
 
@@ -2039,6 +2344,7 @@ class ViserKeyframeEditor:
             size = np.array(geom_size[i])
             rgba = tuple(map(float, geom_rgba[i]))
             group = int(geom_group[i])
+            body_id = int(geom_bodyid[i]) if geom_bodyid is not None else -1
 
             # First, try to get color from MuJoCo material assignment
             mat_id = int(geom_matid[i]) if geom_matid is not None else -1
@@ -2051,6 +2357,8 @@ class ViserKeyframeEditor:
                     rgba = material_colors[mat_name]
 
             self._geom_groups[i] = group
+            self._geom_body_ids[i] = body_id
+            self._body_geom_indices.setdefault(body_id, []).append(i)
             self._geom_base_rgba[i] = rgba
 
             try:
@@ -2159,22 +2467,78 @@ class ViserKeyframeEditor:
                 handle = self.server.scene.add_mesh_trimesh(path, mesh)
             except Exception:
                 try:
+                    alpha = float(max(0.0, min(1.0, rgba[3])))
                     handle = self.server.scene.add_mesh_simple(
                         path,
-                        vertices=np.asarray(mesh.vertices, dtype=float),
-                        faces=np.asarray(mesh.faces, dtype=int),
+                        vertices=np.asarray(mesh.vertices, dtype=np.float32),
+                        faces=np.asarray(mesh.faces, dtype=np.uint32),
                         color=(rgba[0], rgba[1], rgba[2]),
+                        opacity=None if alpha >= 0.995 else alpha,
                     )
                 except Exception:
                     handle = None
 
             if handle is not None:
                 self._geom_handles[i] = handle
+                # Build a lightweight translucent proxy mesh used only when
+                # gizmo-assisted fading is active.
+                fade_handle = None
+                try:
+                    fade_handle = self.server.scene.add_mesh_simple(
+                        f"/robot_fade/{'collision' if group == 3 else 'visual'}/{i:04d}_{name}",
+                        vertices=np.asarray(mesh.vertices, dtype=np.float32),
+                        faces=np.asarray(mesh.faces, dtype=np.uint32),
+                        color=(rgba[0], rgba[1], rgba[2]),
+                        opacity=0.2,
+                        visible=False,
+                    )
+                except Exception:
+                    fade_handle = None
+                if fade_handle is not None:
+                    self._geom_fade_handles[i] = fade_handle
 
         print(
             f"[Viser] Built {len(self._geom_handles)} geom meshes",
             flush=True,
         )
+
+    def _resolve_site_or_body_body_id(self, name: str) -> int:
+        """Resolve a site/body name to its owning body id, or -1 if not found."""
+        try:
+            site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, name)
+            if site_id >= 0:
+                return int(self.model.site_bodyid[site_id])
+        except Exception:
+            pass
+        try:
+            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+            if body_id >= 0:
+                return int(body_id)
+        except Exception:
+            pass
+        return -1
+
+    def _collect_gizmo_fade_geom_indices(self) -> set[int]:
+        """Collect geom indices to fade while gizmos are active."""
+        fade_indices: set[int] = set()
+
+        # Root pose gizmo: fade root-body visuals so the gizmo is easier to see.
+        if self.root_pose_gizmo is not None and bool(
+            getattr(self.root_pose_gizmo, "visible", False)
+        ):
+            root_body_name = str(self.config.root_body or "")
+            if root_body_name:
+                root_body_id = self._resolve_site_or_body_body_id(root_body_name)
+                if root_body_id >= 0:
+                    fade_indices.update(self._body_geom_indices.get(root_body_id, []))
+
+        # EE IK gizmos: fade each targeted end-effector body.
+        for site_name in list(self.ee_target_handles.keys()):
+            body_id = self._resolve_site_or_body_body_id(site_name)
+            if body_id >= 0:
+                fade_indices.update(self._body_geom_indices.get(body_id, []))
+
+        return fade_indices
 
     def _apply_geom_visibility(self) -> None:
         """Update visibility of robot geometry handles."""
@@ -2188,22 +2552,57 @@ class ViserKeyframeEditor:
         except Exception:
             show_all = True
 
+        fade_indices = self._collect_gizmo_fade_geom_indices()
+
         for i, handle in self._geom_handles.items():
+            fade_handle = self._geom_fade_handles.get(i)
             group = self._geom_groups.get(i, 0)
             base = self._geom_base_rgba.get(i, (0.7, 0.7, 0.7, 1.0))
             if show_all:
                 visible = True
             else:
                 visible = (group == 3) if show_collision else (group != 3)
+            alpha = float(base[3])
+            faded = bool(visible and i in fade_indices)
+            if faded:
+                alpha = max(0.04, min(1.0, alpha * self._gizmo_fade_alpha))
             try:
-                if hasattr(handle, "visible"):
-                    handle.visible = visible
-                elif hasattr(handle, "rgba"):
+                if fade_handle is not None:
+                    # Keep high-quality GLB visible normally; swap to translucent
+                    # proxy only while faded.
+                    if hasattr(handle, "visible"):
+                        handle.visible = bool(visible and not faded)
+                    if hasattr(fade_handle, "visible"):
+                        fade_handle.visible = bool(visible and faded)
+                    try:
+                        if visible and faded:
+                            fade_handle.opacity = (
+                                None if alpha >= 0.995 else float(alpha)
+                            )
+                        else:
+                            fade_handle.opacity = 0.0
+                    except Exception:
+                        pass
+                else:
+                    if hasattr(handle, "visible"):
+                        handle.visible = visible
+
+                    # Mesh handles expose opacity directly when simple-mesh is used.
+                    try:
+                        if visible:
+                            handle.opacity = None if alpha >= 0.995 else float(alpha)
+                        else:
+                            handle.opacity = 0.0
+                    except Exception:
+                        pass
+
+                # Fallback path for handles that use rgba.
+                if hasattr(handle, "rgba"):
                     handle.rgba = (
                         float(base[0]),
                         float(base[1]),
                         float(base[2]),
-                        1.0 if visible else 0.05,
+                        float(alpha if visible else 0.05),
                     )
             except Exception:
                 continue
@@ -2258,12 +2657,20 @@ class ViserKeyframeEditor:
                             handle.position = position
                             if hasattr(handle, "wxyz"):
                                 handle.wxyz = (qw, qx, qy, qz)
+                            fade_handle = self._geom_fade_handles.get(index)
+                            if fade_handle is not None:
+                                try:
+                                    if bool(getattr(fade_handle, "visible", False)):
+                                        fade_handle.position = position
+                                        if hasattr(fade_handle, "wxyz"):
+                                            fade_handle.wxyz = (qw, qx, qy, qz)
+                                except Exception:
+                                    pass
                         except Exception:
                             continue
-                    self._apply_geom_visibility()
             except Exception:
                 pass
-            time.sleep(0.05)
+            time.sleep(self._scene_update_dt)
 
     # -- Trajectory methods --
 
@@ -2412,11 +2819,15 @@ class ViserKeyframeEditor:
             result_dict["timed_sequence"] = self.sequence_list
             result_dict["is_robot_relative_frame"] = self.is_relative_frame
 
-            motion_name = (
+            motion_name = str(
                 self.motion_name_input.value
                 if self.motion_name_input
                 else self.config.name
-            )
+            ).strip()
+            if not motion_name:
+                motion_name = str(self.config.name)
+            motion_name = motion_name.replace(" ", "_")
+            result_dict["motion_name"] = motion_name
 
             # Ensure directory exists
             os.makedirs(self.result_dir, exist_ok=True)
@@ -2492,20 +2903,90 @@ class ViserKeyframeEditor:
             self._load_keyframe_to_ui(0)
             return False
 
+        loaded_motion_name: Optional[str] = None
+        if isinstance(data, dict):
+            raw_motion_name = data.get("motion_name")
+            if isinstance(raw_motion_name, str) and raw_motion_name.strip():
+                loaded_motion_name = raw_motion_name.strip().replace(" ", "_")
+        if not loaded_motion_name and self.data_path:
+            loaded_motion_name = os.path.splitext(os.path.basename(self.data_path))[
+                0
+            ].replace(" ", "_")
+        if loaded_motion_name and self.motion_name_input is not None:
+            self._set_handle_value(self.motion_name_input, loaded_motion_name)
+
+        # Validate qpos dimensionality early to avoid hard crashes when loading
+        # motion files created for a different robot model.
+        if isinstance(data, dict):
+            qpos_data = data.get("qpos")
+            if qpos_data is not None:
+                qpos_arr = np.asarray(qpos_data)
+                if qpos_arr.ndim >= 2 and qpos_arr.shape[1] != self.model.nq:
+                    print(
+                        f"[Load] ❌ Incompatible motion file: qpos width={qpos_arr.shape[1]}, "
+                        f"but current model nq={self.model.nq}. "
+                        "This file was likely generated for a different robot.",
+                        flush=True,
+                    )
+                    self.keyframes.append(
+                        Keyframe(
+                            name="default",
+                            motor_pos=default_motor_pos,
+                            joint_pos=default_joint_pos,
+                            qpos=self.home_qpos.copy(),
+                        )
+                    )
+                    self._refresh_keyframes_table()
+                    self._load_keyframe_to_ui(0)
+                    return False
+
         keyframes_data = data.get("keyframes") if isinstance(data, dict) else None
         if keyframes_data is not None:
             loaded_keyframes: List[Keyframe] = []
+            joint_pos_order_warned = False
             for k in keyframes_data:
+                qpos_arr = (
+                    np.array(k["qpos"], dtype=np.float32)
+                    if k.get("qpos") is not None
+                    else None
+                )
+                if qpos_arr is not None and qpos_arr.shape[0] != self.model.nq:
+                    # Keep keyframe entry but drop incompatible qpos.
+                    print(
+                        f"[Load] ⚠️ Skipping incompatible keyframe qpos for '{k.get('name', 'unknown')}': "
+                        f"len={qpos_arr.shape[0]}, model nq={self.model.nq}",
+                        flush=True,
+                    )
+                    qpos_arr = None
+                stored_joint_pos = (
+                    np.array(k["joint_pos"], dtype=np.float32)
+                    if k.get("joint_pos") is not None
+                    else None
+                )
+                joint_pos_arr = stored_joint_pos
+                if qpos_arr is not None:
+                    derived_joint_pos = self._get_joint_pos_from_qpos(qpos_arr)
+                    joint_pos_arr = derived_joint_pos
+                    if (
+                        stored_joint_pos is not None
+                        and stored_joint_pos.shape == derived_joint_pos.shape
+                    ):
+                        max_diff = float(
+                            np.max(np.abs(stored_joint_pos - derived_joint_pos))
+                        )
+                        if max_diff > 1e-3 and not joint_pos_order_warned:
+                            print(
+                                "[Load] Detected legacy joint_pos ordering mismatch; "
+                                "using qpos-derived joint values for sliders.",
+                                flush=True,
+                            )
+                            joint_pos_order_warned = True
                 loaded_keyframes.append(
                     Keyframe(
                         name=k["name"],
                         motor_pos=np.array(k["motor_pos"], dtype=np.float32),
-                        joint_pos=np.array(k["joint_pos"], dtype=np.float32)
-                        if k.get("joint_pos") is not None
-                        else None,
-                        qpos=np.array(k["qpos"], dtype=np.float32)
-                        if k.get("qpos") is not None
-                        else None,
+                        joint_pos=joint_pos_arr,
+                        qpos=qpos_arr,
                     )
                 )
             self.keyframes.extend(loaded_keyframes)
@@ -2619,13 +3100,25 @@ class ViserKeyframeEditor:
     def _load_keyframe_to_ui(self, idx: int) -> None:
         kf = self.keyframes[idx]
         self.selected_keyframe = idx
+        joint_pos_for_ui = kf.joint_pos
         if kf.qpos is not None:
-            self.worker.update_qpos(kf.qpos)
-            # Sync local data.qpos for root slider sync
-            self.data.qpos[:] = kf.qpos
-            mujoco.mj_forward(self.model, self.data)
-        if kf.joint_pos is not None:
-            for jname, val in zip(self.joint_names, kf.joint_pos):
+            if np.asarray(kf.qpos).shape[0] != self.model.nq:
+                print(
+                    f"[Load] ⚠️ Keyframe '{kf.name}' has incompatible qpos length "
+                    f"{np.asarray(kf.qpos).shape[0]} (expected {self.model.nq}); skipping qpos load.",
+                    flush=True,
+                )
+            else:
+                self.worker.update_qpos(kf.qpos)
+                # Sync local data.qpos for root slider sync
+                with self.worker_lock:
+                    self.data.qpos[:] = kf.qpos
+                    mujoco.mj_forward(self.model, self.data)
+                # Keep UI sliders consistent with qpos (source of truth).
+                joint_pos_for_ui = self._get_joint_pos_from_qpos(kf.qpos)
+                kf.joint_pos = joint_pos_for_ui.copy()
+        if joint_pos_for_ui is not None:
+            for jname, val in zip(self.joint_names, joint_pos_for_ui):
                 slider = self.slider_widgets.get(jname)
                 if slider is not None:
                     self._set_handle_value(slider, float(val))
@@ -2635,6 +3128,7 @@ class ViserKeyframeEditor:
             self._set_handle_value(self.keyframe_index_input, str(idx))
         if self.keyframe_name_input is not None:
             self._set_handle_value(self.keyframe_name_input, kf.name)
+        self._refresh_keyframes_table()
         self._refresh_sequence_table()
 
     def _add_to_sequence(self) -> None:
@@ -2679,6 +3173,34 @@ class ViserKeyframeEditor:
         self._refresh_keyframes_summary()
 
     def _refresh_keyframes_summary(self) -> None:
+        if self.keyframes_list_widget is not None:
+            items = tuple(kf.name for kf in self.keyframes)
+            selected_idx = (
+                int(self.selected_keyframe)
+                if self.selected_keyframe is not None
+                and 0 <= self.selected_keyframe < len(self.keyframes)
+                else -1
+            )
+            if selected_idx < 0:
+                self.selected_keyframe = None
+            try:
+                self.keyframes_list_widget.items = items
+            except Exception:
+                pass
+            payload = self._as_list_event_payload(self.keyframes_list_widget)
+            payload.update(
+                {
+                    "event": "select",
+                    "selected_index": selected_idx,
+                    "index": selected_idx,
+                    "text": None,
+                    "src_index": None,
+                    "dst_index": None,
+                }
+            )
+            self._set_handle_value(self.keyframes_list_widget, payload)
+            return
+
         if self.keyframes_summary is None:
             return
         if not self.keyframes:
@@ -2703,6 +3225,37 @@ class ViserKeyframeEditor:
         self._refresh_sequence_summary()
 
     def _refresh_sequence_summary(self) -> None:
+        if self.sequence_list_widget is not None:
+            items = tuple(
+                f"{n}  |  t={self._format_sequence_time_display(t)}s"
+                for n, t in self.sequence_list
+            )
+            selected_idx = (
+                int(self.selected_sequence)
+                if self.selected_sequence is not None
+                and 0 <= self.selected_sequence < len(self.sequence_list)
+                else -1
+            )
+            if selected_idx < 0:
+                self.selected_sequence = None
+            try:
+                self.sequence_list_widget.items = items
+            except Exception:
+                pass
+            payload = self._as_list_event_payload(self.sequence_list_widget)
+            payload.update(
+                {
+                    "event": "select",
+                    "selected_index": selected_idx,
+                    "index": selected_idx,
+                    "text": None,
+                    "src_index": None,
+                    "dst_index": None,
+                }
+            )
+            self._set_handle_value(self.sequence_list_widget, payload)
+            return
+
         if self.sequence_summary is None:
             return
         if not self.sequence_list:
@@ -2711,7 +3264,7 @@ class ViserKeyframeEditor:
             )
             return
         lines = [
-            f"{i}: {n.replace(' ', '_')} &nbsp;&nbsp; t={t}"
+            f"{i}: {n.replace(' ', '_')} &nbsp;&nbsp; t={self._format_sequence_time_display(t)}"
             for i, (n, t) in enumerate(self.sequence_list)
         ]
         content = "<br/>".join(lines)
@@ -2736,18 +3289,7 @@ class ViserKeyframeEditor:
         if self.keyframes:
             self.keyframes[0].qpos = grounded_qpos
             self.keyframes[0].motor_pos = self._get_motor_pos_from_qpos(grounded_qpos)
-            # Also update joint positions from the grounded qpos
-            joint_pos = []
-            for jname in self.joint_names:
-                try:
-                    jnt_id = mujoco.mj_name2id(
-                        self.model, mujoco.mjtObj.mjOBJ_JOINT, jname
-                    )
-                    qpos_adr = self.model.jnt_qposadr[jnt_id]
-                    joint_pos.append(float(grounded_qpos[qpos_adr]))
-                except Exception:
-                    joint_pos.append(0.0)
-            self.keyframes[0].joint_pos = np.array(joint_pos, dtype=np.float32)
+            self.keyframes[0].joint_pos = self._get_joint_pos_from_qpos(grounded_qpos)
 
         # Now load the keyframe to UI
         self._load_keyframe_to_ui(0)
@@ -2961,7 +3503,8 @@ class ViserKeyframeEditor:
         self.keyframes[idx].joint_pos = joint_pos.copy()
         self.keyframes[idx].qpos = qpos.copy()
         # Sync local data.qpos for root slider sync
-        self.data.qpos[:] = qpos
+        with self.worker_lock:
+            self.data.qpos[:] = qpos
         for jname, val in zip(self.joint_names, joint_pos):
             slider = self.slider_widgets.get(jname)
             if slider is not None:
@@ -3304,6 +3847,7 @@ class ViserKeyframeEditor:
             with self.server.gui.add_folder(
                 short_name, expand_by_default=False
             ) as target_folder:
+
                 def _safe_slider(label, lo, hi, step, val):
                     """Create slider with range expanded to fit initial value."""
                     return self.server.gui.add_slider(
@@ -3314,12 +3858,32 @@ class ViserKeyframeEditor:
                         initial_value=val,
                     )
 
-                x_slider = _safe_slider("X (m)", -3.0, 3.0, 0.005, float(initial_pos[0]))
-                y_slider = _safe_slider("Y (m)", -3.0, 3.0, 0.005, float(initial_pos[1]))
-                z_slider = _safe_slider("Z (m)", -0.2, 2.5, 0.005, float(initial_pos[2]))
-                roll_slider = _safe_slider("Roll (rad)", -3.14159, 3.14159, 0.01, float(roll0))
-                pitch_slider = _safe_slider("Pitch (rad)", -3.14159, 3.14159, 0.01, float(pitch0))
-                yaw_slider = _safe_slider("Yaw (rad)", -3.14159, 3.14159, 0.01, float(yaw0))
+                x_slider = _safe_slider(
+                    "X (m)", -3.0, 3.0, 0.005, float(initial_pos[0])
+                )
+                y_slider = _safe_slider(
+                    "Y (m)", -3.0, 3.0, 0.005, float(initial_pos[1])
+                )
+                z_slider = _safe_slider(
+                    "Z (m)", -0.2, 2.5, 0.005, float(initial_pos[2])
+                )
+                roll_slider = _safe_slider(
+                    "Roll (rad)", -3.14, 3.14, 0.01, float(roll0)
+                )
+                pitch_slider = _safe_slider(
+                    "Pitch (rad)", -3.14, 3.14, 0.01, float(pitch0)
+                )
+                yaw_slider = _safe_slider("Yaw (rad)", -3.14, 3.14, 0.01, float(yaw0))
+                for slider in (
+                    x_slider,
+                    y_slider,
+                    z_slider,
+                    roll_slider,
+                    pitch_slider,
+                    yaw_slider,
+                ):
+                    slider.precision = 2
+                    self._set_handle_value(slider, float(slider.value))
                 self.ee_target_slider_widgets[site_name] = {
                     "x": x_slider,
                     "y": y_slider,
@@ -3526,6 +4090,7 @@ class ViserKeyframeEditor:
             self._clear_ee_targets(clear_positions=False)
             self._set_ik_target_ui_state(False)
             print("[Viser][IK] Cleared IK targets (hotkey: T).", flush=True)
+            self._apply_geom_visibility()
             return
         if not self._ik_target_sites:
             print(
@@ -3535,6 +4100,7 @@ class ViserKeyframeEditor:
             return
         self._create_ee_targets(self._ik_target_sites, reset_to_current=True)
         self._set_ik_target_ui_state(True)
+        self._apply_geom_visibility()
 
     def _create_ee_targets(
         self, sites: List[str], *, reset_to_current: bool = False
@@ -3569,7 +4135,7 @@ class ViserKeyframeEditor:
 
             handle = self.server.scene.add_transform_controls(
                 f"/ik_targets/{site_name}",
-                scale=0.18,
+                scale=self.ik_target_gizmo_scale,
                 disable_rotations=False,
                 position=tuple(float(x) for x in pos),
                 wxyz=tuple(float(x) for x in quat),
@@ -3622,6 +4188,7 @@ class ViserKeyframeEditor:
             created += 1
 
         print(f"[Viser][IK] Created {created} draggable EE target(s).", flush=True)
+        self._apply_geom_visibility()
 
     def _clear_ee_targets(self, *, clear_positions: bool = False) -> None:
         """Remove all draggable IK target gizmos."""
@@ -3634,6 +4201,7 @@ class ViserKeyframeEditor:
         if clear_positions:
             self.ee_target_positions.clear()
             self.ee_target_orientations.clear()
+        self._apply_geom_visibility()
 
     def _ik_to_targets(
         self,

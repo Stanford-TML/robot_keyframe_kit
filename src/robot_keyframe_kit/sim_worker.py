@@ -108,7 +108,9 @@ class SimWorker(threading.Thread):
         # For motor-type actuators, we need to compute PD control ourselves
         self.actuator_is_motor: List[bool] = []
         self.actuator_joint_ids: List[int] = []
+        self.actuator_torque_limits: np.ndarray = np.array([], dtype=np.float64)
         self._detect_actuator_types()
+        self._compute_actuator_torque_limits()
 
         # Index tracking for velocity extraction (matching toddlerbot approach)
         # motor_indices: indices of actuator-controlled joints in qpos/qvel
@@ -262,7 +264,12 @@ class SimWorker(threading.Thread):
                 actuator_len = float(self.data.actuator_length[i])
                 actuator_vel = float(self.data.actuator_velocity[i])
                 error = float(targets[i]) - actuator_len
-                ctrl[i] = kp * error - kd * actuator_vel
+                torque = kp * error - kd * actuator_vel
+                if i < len(self.actuator_torque_limits):
+                    tau_lim = float(self.actuator_torque_limits[i])
+                    if np.isfinite(tau_lim) and tau_lim > 0.0:
+                        torque = float(np.clip(torque, -tau_lim, tau_lim))
+                ctrl[i] = torque
 
                 if debug and i == 0:
                     print(
@@ -272,6 +279,63 @@ class SimWorker(threading.Thread):
                     )
 
         return ctrl
+
+    def _compute_actuator_torque_limits(self) -> None:
+        """Build per-actuator torque limits for manual motor PD control.
+
+        Priority:
+        1) Actuator force limits (`forcelimited` + `forcerange`)
+        2) Actuator ctrl limits (`ctrllimited` + `ctrlrange`)
+        3) Config fallback (`motor_tau_limit`)
+        """
+        limits = np.full(self.model.nu, np.inf, dtype=np.float64)
+        fallback = max(0.0, float(getattr(self.config, "motor_tau_limit", 1.0)))
+        using_fallback = 0
+
+        for act_id in range(self.model.nu):
+            if act_id >= len(self.actuator_is_motor) or (
+                not self.actuator_is_motor[act_id]
+            ):
+                continue
+
+            tau_lim = np.inf
+
+            # Prefer explicit force limits.
+            try:
+                if int(self.model.actuator_forcelimited[act_id]) != 0:
+                    lo, hi = self.model.actuator_forcerange[act_id]
+                    candidate = max(abs(float(lo)), abs(float(hi)))
+                    if candidate > 0.0:
+                        tau_lim = candidate
+            except Exception:
+                pass
+
+            # Fall back to ctrl limits if present.
+            if not np.isfinite(tau_lim):
+                try:
+                    if int(self.model.actuator_ctrllimited[act_id]) != 0:
+                        lo, hi = self.model.actuator_ctrlrange[act_id]
+                        candidate = max(abs(float(lo)), abs(float(hi)))
+                        if candidate > 0.0:
+                            tau_lim = candidate
+                except Exception:
+                    pass
+
+            # Final fallback for models with unconstrained motor actuators.
+            if not np.isfinite(tau_lim):
+                if fallback > 0.0:
+                    tau_lim = fallback
+                    using_fallback += 1
+
+            limits[act_id] = tau_lim
+
+        self.actuator_torque_limits = limits
+
+        if using_fallback > 0:
+            print(
+                f"[SimWorker] Using fallback motor torque limit {fallback:.3f} for {using_fallback} actuator(s)",
+                flush=True,
+            )
 
     # ----- Helper methods for raw MuJoCo -----
     def _get_body_transform(self, body_name: str) -> np.ndarray:
