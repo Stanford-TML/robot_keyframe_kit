@@ -177,6 +177,9 @@ class ViserKeyframeEditor:
         self.body_ang_vel_replay: List[np.ndarray] = []
         self.site_pos_replay: List[np.ndarray] = []
         self.site_quat_replay: List[np.ndarray] = []
+        # `Update` should commit one state callback into the selected keyframe.
+        # `Test`/`Ground` callbacks are preview-only and must not overwrite keyframes.
+        self._commit_next_on_state: bool = False
 
         self.saved_ee_poses: Dict[str, np.ndarray] = {}
         self.ee_target_handles: Dict[str, object] = {}
@@ -1487,7 +1490,11 @@ class ViserKeyframeEditor:
                 elif val == "Remove":
                     self._remove_keyframe()
                 elif val == "Update":
+                    self._commit_next_on_state = True
                     self.worker.request_state_data()
+                    # If no callback arrived (e.g. request ignored), clear stale commit intent.
+                    if self._commit_next_on_state:
+                        self._commit_next_on_state = False
 
             keyframe_ops_row2 = self.server.gui.add_button_group(
                 "Actions",
@@ -3549,13 +3556,16 @@ class ViserKeyframeEditor:
         joint_pos: np.ndarray,
         qpos: np.ndarray,
     ) -> None:
-        if self.selected_keyframe is None:
-            return
-        idx = self.selected_keyframe
-        self.keyframes[idx].motor_pos = motor_pos.copy()
-        self.keyframes[idx].joint_pos = joint_pos.copy()
-        self.keyframes[idx].qpos = qpos.copy()
-        # Sync local data.qpos for root slider sync
+        commit_to_keyframe = bool(self._commit_next_on_state)
+        self._commit_next_on_state = False
+
+        if commit_to_keyframe and self.selected_keyframe is not None:
+            idx = self.selected_keyframe
+            self.keyframes[idx].motor_pos = motor_pos.copy()
+            self.keyframes[idx].joint_pos = joint_pos.copy()
+            self.keyframes[idx].qpos = qpos.copy()
+
+        # Always sync live UI/scene state from worker callback.
         with self.worker_lock:
             self.data.qpos[:] = qpos
         for jname, val in zip(self.joint_names, joint_pos):
