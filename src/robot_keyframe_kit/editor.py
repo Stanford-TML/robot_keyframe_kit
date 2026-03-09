@@ -2808,13 +2808,12 @@ class ViserKeyframeEditor:
             result_dict["body_ang_vel"] = np.array(self.body_ang_vel_replay)
             result_dict["site_pos"] = np.array(self.site_pos_replay)
             result_dict["site_quat"] = np.array(self.site_quat_replay)
-            result_dict["action"] = (
-                None
-                if self.is_qpos_traj
-                else np.array(self.action_traj)
-                if self.action_traj
-                else None
-            )
+            if self.is_qpos_traj or self.action_traj is None:
+                action_to_save = None
+            else:
+                action_arr = np.asarray(self.action_traj)
+                action_to_save = action_arr if action_arr.size > 0 else None
+            result_dict["action"] = action_to_save
             result_dict["keyframes"] = saved_keyframes
             result_dict["timed_sequence"] = self.sequence_list
             result_dict["is_robot_relative_frame"] = self.is_relative_frame
