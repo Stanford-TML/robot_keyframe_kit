@@ -401,6 +401,57 @@ class ViserKeyframeEditor:
         print("[Viser] Using model qpos0 as startup pose.", flush=True)
         return np.array(self.model.qpos0, dtype=np.float32).copy()
 
+    def _synchronize_parallel_linkage_qpos(self, qpos: np.ndarray) -> np.ndarray:
+        """Synchronize hidden linkage joints (motor/rods) from motion joints.
+
+        Viewport IK can update visible motion joints (e.g. ``neck_pitch``) without
+        updating hidden drive joints (e.g. ``neck_pitch_act``). Physics `Test` runs
+        actuator-space control, so we need consistent hidden joints before deriving
+        motor targets.
+        """
+        q = np.asarray(qpos, dtype=np.float64).copy()
+        if q.shape[0] != self.model.nq:
+            return q
+
+        # 1) Motion -> motor for parallel linkages.
+        for motion_joint, (
+            motor_joint,
+            ratio,
+        ) in self.parallel_linkages_inverse.items():
+            if abs(float(ratio)) <= 1e-8:
+                continue
+            motion_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, motion_joint
+            )
+            motor_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, motor_joint
+            )
+            if motion_id < 0 or motor_id < 0:
+                continue
+            motion_adr = int(self.model.jnt_qposadr[motion_id])
+            motor_adr = int(self.model.jnt_qposadr[motor_id])
+            q[motor_adr] = float(q[motion_adr]) / float(ratio)
+
+        # 2) Motor -> passive rods for visual/kinematic consistency.
+        for motor_joint, rod_specs in self.passive_rod_joints.items():
+            motor_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, motor_joint
+            )
+            if motor_id < 0:
+                continue
+            motor_adr = int(self.model.jnt_qposadr[motor_id])
+            motor_val = float(q[motor_adr])
+            for rod_joint, ratio in rod_specs:
+                rod_id = mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_JOINT, rod_joint
+                )
+                if rod_id < 0:
+                    continue
+                rod_adr = int(self.model.jnt_qposadr[rod_id])
+                q[rod_adr] = motor_val * float(ratio)
+
+        return q
+
     def _get_motor_pos_from_qpos(self, qpos: np.ndarray) -> np.ndarray:
         """Compute actuator-space targets from a given qpos."""
         if self.model.nu <= 0:
@@ -408,7 +459,7 @@ class ViserKeyframeEditor:
         if not self.actuator_names:
             return np.zeros(self.model.nu, dtype=np.float32)
 
-        qpos_arr = np.asarray(qpos, dtype=np.float64)
+        qpos_arr = self._synchronize_parallel_linkage_qpos(qpos)
         with self.worker_lock:
             prev_qpos = self.data.qpos.copy()
             prev_qvel = self.data.qvel.copy()
@@ -876,9 +927,9 @@ class ViserKeyframeEditor:
 
                 if motor_base == motion_base or motion_base in motor_name:
                     # Found a parallel linkage pair!
-                    # Approximate ratio: typically close to -1.0 for parallel linkages
-                    self.parallel_linkages[motor_name] = (motion_name, -1.0)
-                    self.parallel_linkages_inverse[motion_name] = (motor_name, -1.0)
+                    # Approximate ratio: typically close to +1.0 for motor->motion in four-bar linkages
+                    self.parallel_linkages[motor_name] = (motion_name, 1.0)
+                    self.parallel_linkages_inverse[motion_name] = (motor_name, 1.0)
 
         if self.parallel_linkages:
             print(
@@ -3299,7 +3350,10 @@ class ViserKeyframeEditor:
         kf = self.keyframes[self.selected_keyframe]
         if kf.qpos is None:
             return
-        # Ensure motor target is synchronized with current qpos before testing.
+        # Keep hidden linkage joints in sync before deriving actuator targets.
+        synced_qpos = self._synchronize_parallel_linkage_qpos(kf.qpos)
+        kf.qpos = synced_qpos.astype(np.float32)
+        kf.joint_pos = self._get_joint_pos_from_qpos(kf.qpos)
         kf.motor_pos = self._get_motor_pos_from_qpos(kf.qpos)
         physics_enabled = (
             bool(self.physics_enabled.value) if self.physics_enabled else True
