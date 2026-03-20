@@ -201,6 +201,7 @@ class ViserKeyframeEditor:
         self._geom_body_ids: Dict[int, int] = {}
         self._body_geom_indices: Dict[int, List[int]] = {}
         self._geom_base_rgba: Dict[int, Tuple[float, float, float, float]] = {}
+        self._geom_is_collision: Dict[int, bool] = {}
         self._scene_handles: Dict[str, object] = {}
         self._mesh_file_map: Dict[str, str] = {}
         self._mesh_scale_map: Dict[str, Tuple[float, float, float]] = {}
@@ -2203,6 +2204,7 @@ class ViserKeyframeEditor:
         self._geom_body_ids.clear()
         self._body_geom_indices.clear()
         self._geom_base_rgba.clear()
+        self._geom_is_collision.clear()
         self._mesh_file_map.clear()
         self._mesh_scale_map.clear()
         self._mesh_quat_map.clear()
@@ -2364,6 +2366,16 @@ class ViserKeyframeEditor:
                 if hasattr(m, "geom_matid")
                 else np.full(m.ngeom, -1, dtype=np.int32)
             )
+            geom_contype = (
+                np.array(m.geom_contype, dtype=np.int32)
+                if hasattr(m, "geom_contype")
+                else np.zeros(m.ngeom, dtype=np.int32)
+            )
+            geom_conaffinity = (
+                np.array(m.geom_conaffinity, dtype=np.int32)
+                if hasattr(m, "geom_conaffinity")
+                else np.zeros(m.ngeom, dtype=np.int32)
+            )
             # Get material RGBA colors from MuJoCo
             mat_rgba = (
                 np.array(m.mat_rgba, dtype=np.float32)
@@ -2384,6 +2396,8 @@ class ViserKeyframeEditor:
             geom_dataid = np.full(m.ngeom, -1, dtype=np.int32)
             geom_bodyid = np.full(m.ngeom, -1, dtype=np.int32)
             geom_matid = np.full(m.ngeom, -1, dtype=np.int32)
+            geom_contype = np.zeros(m.ngeom, dtype=np.int32)
+            geom_conaffinity = np.zeros(m.ngeom, dtype=np.int32)
             mat_rgba = None
 
         mesh_vert = getattr(m, "mesh_vert", None)
@@ -2418,6 +2432,9 @@ class ViserKeyframeEditor:
             self._geom_body_ids[i] = body_id
             self._body_geom_indices.setdefault(body_id, []).append(i)
             self._geom_base_rgba[i] = rgba
+            contype = int(geom_contype[i]) if geom_contype is not None else 0
+            conaffinity = int(geom_conaffinity[i]) if geom_conaffinity is not None else 0
+            self._geom_is_collision[i] = bool(contype != 0 or conaffinity != 0)
 
             try:
                 if gtype == int(mujoco.mjtGeom.mjGEOM_PLANE) or "floor" in name:
@@ -2616,10 +2633,17 @@ class ViserKeyframeEditor:
             fade_handle = self._geom_fade_handles.get(i)
             group = self._geom_groups.get(i, 0)
             base = self._geom_base_rgba.get(i, (0.7, 0.7, 0.7, 1.0))
+            has_contact = bool(self._geom_is_collision.get(i, False))
+            is_collision_group = group == 3
             if show_all:
                 visible = True
+            elif show_collision:
+                # Collision mode: preserve original robot collision set (group 3)
+                # and additionally include contact-enabled scene geoms (e.g. cart).
+                visible = is_collision_group or has_contact
             else:
-                visible = (group == 3) if show_collision else (group != 3)
+                # Default mode: preserve original visual view (hide only group-3 collision geoms).
+                visible = group != 3
             alpha = float(base[3])
             faded = bool(visible and i in fade_indices)
             if faded:
