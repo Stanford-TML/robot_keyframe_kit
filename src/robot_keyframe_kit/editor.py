@@ -11,6 +11,7 @@ The sim/robot parameters have been replaced with direct MuJoCo usage.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -74,6 +75,7 @@ class ViserKeyframeEditor:
         config: Optional[EditorConfig] = None,
         *,
         data_path: str = "",
+        start_keyframe: Optional[int] = None,
     ) -> None:
         """Initialize the keyframe editor.
 
@@ -81,6 +83,7 @@ class ViserKeyframeEditor:
             xml_path: Path to the MuJoCo XML scene file.
             config: Optional configuration object. Uses defaults if not provided.
             data_path: Optional path to load existing keyframe data from.
+            start_keyframe: Optional keyframe index to select after data load.
         """
         if config is None:
             config = EditorConfig()
@@ -88,6 +91,9 @@ class ViserKeyframeEditor:
         self.config = config
         self.xml_path = os.path.abspath(xml_path)
         self.dt = config.dt
+        # Start-keyframe CLI plumbing is temporarily disabled for public release.
+        self.start_keyframe = None
+        # self.start_keyframe = start_keyframe
         self.root_pose_gizmo_scale = float(config.root_pose_gizmo_scale)
         self.ik_target_gizmo_scale = float(config.ik_target_gizmo_scale)
 
@@ -152,6 +158,24 @@ class ViserKeyframeEditor:
         self.result_dir = os.path.join(config.save_dir, config.name)
         os.makedirs(self.result_dir, exist_ok=True)
         self.data_path = data_path
+
+        # Screenshot-only UI and camera-pose workflow are temporarily disabled
+        # for public release. Keep these paths for internal use later.
+        self.joint_sliders_only = False
+        self.camera_pose_path = os.path.abspath(
+            os.path.join(config.save_dir, "_camera_pose.json")
+        )
+        self._latest_camera_pose: Optional[Dict[str, object]] = None
+        self._last_camera_pose_autosave_ts = 0.0
+
+        # mode_env = os.getenv("RKF_JOINT_SLIDERS_ONLY", "").strip().lower()
+        # self.joint_sliders_only = mode_env in {"1", "true", "yes", "on"}
+        # camera_pose_env = os.getenv("RKF_CAMERA_POSE_PATH", "").strip()
+        # self.camera_pose_path = (
+        #     os.path.abspath(camera_pose_env)
+        #     if camera_pose_env
+        #     else os.path.abspath(os.path.join(config.save_dir, "_camera_pose.json"))
+        # )
 
         # Mirror configuration - can be customized via config, then auto-computed
         self.mirror_joint_signs = (
@@ -260,18 +284,35 @@ class ViserKeyframeEditor:
 
         @self.server.on_client_connect
         def _(client: viser.ClientHandle) -> None:
-            """Apply a sensible default orbit camera when a client connects."""
-            camera_pos = (1.5, -0.5, 0.55)
-            look_at_pos = (0.0, 0.0, 0.25)
+            """Apply startup camera pose and track the latest viewport camera."""
+            default_pose: Dict[str, object] = {
+                "position": [1.5, -0.5, 0.55],
+                "look_at": [0.0, 0.0, 0.25],
+                "up_direction": [0.0, 0.0, 1.0],
+                "fov": float(np.deg2rad(55.0)),
+            }
+            pose_to_apply = default_pose
+            if self.joint_sliders_only:
+                loaded_pose = self._load_camera_pose_from_file()
+                if loaded_pose is not None:
+                    pose_to_apply = loaded_pose
+
             try:
-                client.camera.position = camera_pos
-                client.camera.look_at = look_at_pos
-                if hasattr(client.camera, "up"):
-                    client.camera.up = (0.0, 0.0, 1.0)
-                if hasattr(client.camera, "vertical_fov"):
-                    client.camera.vertical_fov = 55.0
-            except Exception:
-                pass
+                self._apply_camera_pose(client, pose_to_apply)
+            except Exception as exc:
+                print(f"[Viser] Failed to apply startup camera pose: {exc}", flush=True)
+
+            @client.camera.on_update
+            def _(camera) -> None:
+                pose = self._camera_pose_from_handle(camera)
+                if pose is None:
+                    return
+                self._latest_camera_pose = pose
+                if self.joint_sliders_only:
+                    now = time.monotonic()
+                    if now - self._last_camera_pose_autosave_ts >= 1.0:
+                        if self._save_latest_camera_pose(verbose=False):
+                            self._last_camera_pose_autosave_ts = now
 
         if hasattr(self.server, "on_key_event"):
 
@@ -287,6 +328,13 @@ class ViserKeyframeEditor:
                     return
                 if key == "t":
                     self._toggle_ik_targets()
+                    return
+                # Screenshot/camera-pose workflow hotkeys are disabled for public release.
+                # if key == "c":
+                #     self._print_latest_camera_pose()
+                #     return
+                # if key == "v":
+                #     self._save_latest_camera_pose(verbose=True)
 
         try:
             mujoco.mj_forward(self.model, self.data)
@@ -341,7 +389,7 @@ class ViserKeyframeEditor:
 
         self._apply_geom_visibility()
 
-        if config.show_com:
+        if config.show_com and not self.joint_sliders_only:
             try:
                 self._com_sphere = self.server.scene.add_icosphere(
                     "/robot/com",
@@ -1413,14 +1461,161 @@ class ViserKeyframeEditor:
             flush=True,
         )
 
+    def _camera_pose_from_handle(self, camera: object) -> Optional[Dict[str, object]]:
+        """Extract serializable camera pose from a Viser camera handle."""
+        try:
+            position = np.asarray(getattr(camera, "position"), dtype=np.float64)
+            look_at = np.asarray(getattr(camera, "look_at"), dtype=np.float64)
+            up_attr = getattr(camera, "up_direction", None)
+            if up_attr is None:
+                up_attr = getattr(camera, "up", None)
+            if up_attr is None:
+                return None
+            up_direction = np.asarray(up_attr, dtype=np.float64)
+
+            fov_attr = getattr(camera, "fov", None)
+            if fov_attr is None:
+                fov_attr = getattr(camera, "vertical_fov", None)
+            if fov_attr is None:
+                return None
+            fov = float(fov_attr)
+            return {
+                "position": [float(x) for x in position.tolist()],
+                "look_at": [float(x) for x in look_at.tolist()],
+                "up_direction": [float(x) for x in up_direction.tolist()],
+                "fov": fov,
+            }
+        except Exception:
+            return None
+
+    def _apply_camera_pose(
+        self, client: viser.ClientHandle, pose: Dict[str, object]
+    ) -> None:
+        """Apply a camera pose dict to a connected client."""
+        pos = tuple(float(x) for x in pose.get("position", [1.5, -0.5, 0.55]))
+        look_at = tuple(float(x) for x in pose.get("look_at", [0.0, 0.0, 0.25]))
+        up = tuple(float(x) for x in pose.get("up_direction", [0.0, 0.0, 1.0]))
+        fov = float(pose.get("fov", float(np.deg2rad(55.0))))
+
+        client.camera.position = pos
+        client.camera.look_at = look_at
+        if hasattr(client.camera, "up_direction"):
+            client.camera.up_direction = up
+        elif hasattr(client.camera, "up"):
+            client.camera.up = up
+
+        if hasattr(client.camera, "fov"):
+            client.camera.fov = fov
+        elif hasattr(client.camera, "vertical_fov"):
+            client.camera.vertical_fov = fov
+
+    def _load_camera_pose_from_file(self) -> Optional[Dict[str, object]]:
+        """Load camera pose json from disk."""
+        if not self.camera_pose_path or not os.path.exists(self.camera_pose_path):
+            return None
+        try:
+            with open(self.camera_pose_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return None
+            required = ["position", "look_at", "up_direction", "fov"]
+            if not all(k in payload for k in required):
+                return None
+            return payload
+        except Exception as exc:
+            print(f"[Viser] Failed to load camera pose file: {exc}", flush=True)
+            return None
+
+    def _print_latest_camera_pose(self) -> None:
+        """Print latest camera pose as JSON for easy reuse."""
+        pose = self._latest_camera_pose
+        if pose is None:
+            clients = self.server.get_clients()
+            if clients:
+                first_client = next(iter(clients.values()))
+                pose = self._camera_pose_from_handle(first_client.camera)
+                if pose is not None:
+                    self._latest_camera_pose = pose
+        if pose is None:
+            print(
+                "[Viser] Camera pose unavailable yet; move camera once and try again.",
+                flush=True,
+            )
+            return
+        print("[Viser] Camera pose JSON:", flush=True)
+        print(json.dumps(pose, indent=2), flush=True)
+
+    def _save_latest_camera_pose(self, *, verbose: bool = True) -> bool:
+        """Save latest camera pose to configured JSON path."""
+        pose = self._latest_camera_pose
+        if pose is None:
+            clients = self.server.get_clients()
+            if clients:
+                first_client = next(iter(clients.values()))
+                pose = self._camera_pose_from_handle(first_client.camera)
+                if pose is not None:
+                    self._latest_camera_pose = pose
+        if pose is None:
+            if verbose:
+                print(
+                    "[Viser] Camera pose unavailable yet; move camera once and try again.",
+                    flush=True,
+                )
+            return False
+
+        try:
+            os.makedirs(os.path.dirname(self.camera_pose_path), exist_ok=True)
+            with open(self.camera_pose_path, "w", encoding="utf-8") as f:
+                json.dump(pose, f, indent=2)
+            if verbose:
+                print(
+                    f"[Viser] Saved camera pose to: {self.camera_pose_path}", flush=True
+                )
+            return True
+        except Exception as exc:
+            if verbose:
+                print(f"[Viser] Failed to save camera pose: {exc}", flush=True)
+            return False
+
     # -- GUI helpers --
 
     def _build_ui(self) -> None:
-        """Construct the three-column GUI layout (controls + joint sliders)."""
+        """Construct GUI layout (full editor or screenshot-friendly slider-only mode)."""
         left_joints, right_joints = self._split_joint_lists()
+
+        if self.joint_sliders_only:
+            # Still discover IK targets so hotkey T works in screenshot mode.
+            self._get_ee_sites_for_panels()
+
+            columns_handle: Optional[viser.GuiColumnsHandle]
+            try:
+                columns_handle = self.server.gui.add_columns(2, widths=(0.175, 0.175))
+                print(
+                    "[Viser] Using gui.add_columns(2) for joint-sliders-only mode.",
+                    flush=True,
+                )
+            except Exception as exc:
+                columns_handle = None
+                print(
+                    f"[Viser] add_columns(2) unavailable, falling back to single column (slider-only): {exc}",
+                    flush=True,
+                )
+
+            if columns_handle is not None:
+                left_col, right_col = columns_handle
+                with left_col:
+                    self._build_joint_slider_column(left_joints, "Joint Sliders (L)")
+                with right_col:
+                    self._build_joint_slider_column(right_joints, "Joint Sliders (R)")
+                return
+
+            self._build_joint_slider_column(left_joints, "Joint Sliders (L)")
+            self._build_joint_slider_column(right_joints, "Joint Sliders (R)")
+            return
+
         ee_sites = self._get_ee_sites_for_panels()
 
-        columns_handle: Optional[viser.GuiColumnsHandle]
+        columns_handle = None
         try:
             columns_handle = self.server.gui.add_columns(
                 3,
@@ -1431,7 +1626,6 @@ class ViserKeyframeEditor:
                 flush=True,
             )
         except Exception as exc:
-            columns_handle = None
             print(
                 f"[Viser] add_columns(3) unavailable, falling back to single column: {exc}",
                 flush=True,
@@ -2433,7 +2627,9 @@ class ViserKeyframeEditor:
             self._body_geom_indices.setdefault(body_id, []).append(i)
             self._geom_base_rgba[i] = rgba
             contype = int(geom_contype[i]) if geom_contype is not None else 0
-            conaffinity = int(geom_conaffinity[i]) if geom_conaffinity is not None else 0
+            conaffinity = (
+                int(geom_conaffinity[i]) if geom_conaffinity is not None else 0
+            )
             self._geom_is_collision[i] = bool(contype != 0 or conaffinity != 0)
 
             try:
@@ -2875,6 +3071,25 @@ class ViserKeyframeEditor:
 
     # -- Data save/load --
 
+    def _resolve_start_keyframe_index(self) -> int:
+        """Resolve startup keyframe index with bounds checking."""
+        if not self.keyframes:
+            return 0
+        if self.start_keyframe is None:
+            return 0
+
+        idx = int(self.start_keyframe)
+        if 0 <= idx < len(self.keyframes):
+            print(f"[Load] Using start keyframe index {idx}.", flush=True)
+            return idx
+
+        clamped = max(0, min(len(self.keyframes) - 1, idx))
+        print(
+            f"[Load] Requested start keyframe {idx} out of range for {len(self.keyframes)} keyframes; using {clamped}.",
+            flush=True,
+        )
+        return clamped
+
     def _save_data(self) -> None:
         try:
             result_dict: Dict[str, object] = {}
@@ -2961,7 +3176,7 @@ class ViserKeyframeEditor:
                 )
             )
             self._refresh_keyframes_table()
-            self._load_keyframe_to_ui(0)
+            self._load_keyframe_to_ui(self._resolve_start_keyframe_index())
             return False
 
         try:
@@ -2981,7 +3196,7 @@ class ViserKeyframeEditor:
                 )
             )
             self._refresh_keyframes_table()
-            self._load_keyframe_to_ui(0)
+            self._load_keyframe_to_ui(self._resolve_start_keyframe_index())
             return False
 
         loaded_motion_name: Optional[str] = None
@@ -3018,7 +3233,7 @@ class ViserKeyframeEditor:
                         )
                     )
                     self._refresh_keyframes_table()
-                    self._load_keyframe_to_ui(0)
+                    self._load_keyframe_to_ui(self._resolve_start_keyframe_index())
                     return False
 
         keyframes_data = data.get("keyframes") if isinstance(data, dict) else None
@@ -3088,7 +3303,7 @@ class ViserKeyframeEditor:
                 flush=True,
             )
             if self.keyframes:
-                self._load_keyframe_to_ui(0)
+                self._load_keyframe_to_ui(self._resolve_start_keyframe_index())
             return True
 
         # No keyframes in data
@@ -3102,7 +3317,7 @@ class ViserKeyframeEditor:
             )
         )
         self._refresh_keyframes_table()
-        self._load_keyframe_to_ui(0)
+        self._load_keyframe_to_ui(self._resolve_start_keyframe_index())
         return False
 
     # -- Keyframe operations --
@@ -3793,7 +4008,82 @@ class ViserKeyframeEditor:
                     if body_name and body_name != "world":
                         ee_sites.append(body_name)
 
-        return ee_sites
+        def _score_ee_candidate(name: str) -> float:
+            n = name.lower()
+            score = 0.0
+            # Strong positive signals.
+            if "tip" in n:
+                score += 100.0
+            if "center" in n:
+                score += 70.0
+            if "hand" in n:
+                score += 55.0
+            if "foot" in n:
+                score += 55.0
+            if "wrist" in n or "ankle" in n:
+                score += 20.0
+            # Penalize helper/internal endpoint names that often appear as leaves.
+            if "intermediate" in n:
+                score -= 90.0
+            # Exclude dense ankle helper spheres while still allowing hand tip names.
+            if "sphere" in n and not ("hand" in n and "tip" in n):
+                score -= 75.0
+            return score
+
+        def _classify_side(name: str) -> Optional[str]:
+            n = name.lower()
+            if "left" in n or n.startswith("l_"):
+                return "left"
+            if "right" in n or n.startswith("r_"):
+                return "right"
+            return None
+
+        def _classify_limb(name: str) -> Optional[str]:
+            n = name.lower()
+            if any(
+                k in n for k in ["hand", "wrist", "palm", "gripper", "finger", "thumb"]
+            ):
+                return "arm"
+            if any(
+                k in n for k in ["foot", "ankle", "toe", "heel", "leg", "calf", "shin"]
+            ):
+                return "leg"
+            return None
+
+        # Prefer one best endpoint for each side+limb bucket first so the first few
+        # IK targets include both feet and hands on models with many helper leaves.
+        bucket_best: Dict[Tuple[str, str], Tuple[float, str]] = {}
+        for entry in ee_sites:
+            side = _classify_side(entry)
+            limb = _classify_limb(entry)
+            if side is None or limb is None:
+                continue
+            bucket = (side, limb)
+            score = _score_ee_candidate(entry)
+            prev = bucket_best.get(bucket)
+            if prev is None or score > prev[0]:
+                bucket_best[bucket] = (score, entry)
+
+        prioritized: List[str] = []
+        for bucket in [
+            ("left", "leg"),
+            ("right", "leg"),
+            ("left", "arm"),
+            ("right", "arm"),
+        ]:
+            if bucket in bucket_best:
+                prioritized.append(bucket_best[bucket][1])
+
+        seen = {name.lower() for name in prioritized}
+        remainder = sorted(ee_sites, key=_score_ee_candidate, reverse=True)
+        for entry in remainder:
+            key = entry.lower()
+            if key in seen:
+                continue
+            prioritized.append(entry)
+            seen.add(key)
+
+        return prioritized
 
     def _get_ee_sites_for_panels(self) -> List[str]:
         """Get EE sites used by IK and anchor GUI panels."""
@@ -3811,7 +4101,47 @@ class ViserKeyframeEditor:
             self._ik_target_sites = []
             return []
 
-        shown_sites = sites[:8]
+        def _classify_side_limb(name: str) -> Tuple[Optional[str], Optional[str]]:
+            n = name.lower()
+            side: Optional[str] = None
+            if "left" in n or n.startswith("l_"):
+                side = "left"
+            elif "right" in n or n.startswith("r_"):
+                side = "right"
+
+            limb: Optional[str] = None
+            if any(
+                k in n for k in ["hand", "wrist", "palm", "gripper", "finger", "thumb"]
+            ):
+                limb = "arm"
+            elif any(
+                k in n for k in ["foot", "ankle", "toe", "heel", "leg", "calf", "shin"]
+            ):
+                limb = "leg"
+
+            return side, limb
+
+        # Prefer a compact default target set (L/R feet + L/R hands) when available.
+        primary: List[str] = []
+        used = set()
+        for bucket in [
+            ("left", "leg"),
+            ("right", "leg"),
+            ("left", "arm"),
+            ("right", "arm"),
+        ]:
+            for candidate in sites:
+                side, limb = _classify_side_limb(candidate)
+                if (side, limb) == bucket and candidate.lower() not in used:
+                    primary.append(candidate)
+                    used.add(candidate.lower())
+                    break
+
+        if len(primary) == 4:
+            shown_sites = primary
+        else:
+            shown_sites = sites[:8]
+
         self._ik_target_sites = shown_sites.copy()
         return shown_sites
 
@@ -4661,6 +4991,7 @@ class ViserKeyframeEditor:
                 self.relative_frame_checked = self.server.gui.add_checkbox(
                     "Use Robot Frame",
                     True,
+                    hint="Replay body-state arrays are saved in robot-root frame; keyframe qpos/action are unchanged.",
                 )
 
             row3 = self.server.gui.add_columns(2, widths=(1.0, 1.0))
@@ -4804,6 +5135,12 @@ def main() -> None:
         action="store_true",
         help="Disable automatic floor injection for robot-only XML files. Use scene.xml instead for best results.",
     )
+    # parser.add_argument(
+    #     "--start-keyframe",
+    #     type=int,
+    #     default=None,
+    #     help="Initial keyframe index to select after loading data.",
+    # )
     args = parser.parse_args()
 
     # Handle config generation
@@ -4841,6 +5178,7 @@ def main() -> None:
         args.xml_path,
         config=config,
         data_path=args.data,
+        # start_keyframe=args.start_keyframe,
     )
 
     # Get actual port from viser server
