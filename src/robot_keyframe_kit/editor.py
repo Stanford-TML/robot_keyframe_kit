@@ -1478,7 +1478,7 @@ class ViserKeyframeEditor:
 
         with self.server.gui.add_folder("🔑 Keyframe Operations"):
             keyframe_ops_row1 = self.server.gui.add_button_group(
-                "Actions",
+                "",
                 ["Add", "Remove", "Update"],
             )
 
@@ -1497,7 +1497,7 @@ class ViserKeyframeEditor:
                         self._commit_next_on_state = False
 
             keyframe_ops_row2 = self.server.gui.add_button_group(
-                "Actions",
+                "",
                 ["Test", "Ground"],
             )
 
@@ -1511,7 +1511,7 @@ class ViserKeyframeEditor:
 
         with self.server.gui.add_folder("🎬 Sequence Operations"):
             seq_ops_row1 = self.server.gui.add_button_group(
-                "Sequence",
+                "",
                 ["Add to Seq", "Remove from Seq"],
             )
 
@@ -1524,7 +1524,7 @@ class ViserKeyframeEditor:
                     self._remove_from_sequence()
 
             seq_ops_row2 = self.server.gui.add_button_group(
-                "Sequence",
+                "",
                 ["Play Traj", "Play Qpos", "Stop"],
             )
 
@@ -1627,7 +1627,7 @@ class ViserKeyframeEditor:
                     self.config.name,
                 )
                 keyframe_actions = self.server.gui.add_button_group(
-                    "Actions",
+                    "",
                     ["Copy", "Move Up", "Move Down"],
                 )
 
@@ -1682,7 +1682,7 @@ class ViserKeyframeEditor:
                     "0.0",
                 )
                 sequence_actions = self.server.gui.add_button_group(
-                    "Actions",
+                    "",
                     ["Move Up", "Move Down"],
                 )
 
@@ -4635,7 +4635,7 @@ class ViserKeyframeEditor:
                 )
             with row2[1]:
                 self.relative_frame_checked = self.server.gui.add_checkbox(
-                    "Save in Robot Frame",
+                    "Use Robot Frame",
                     True,
                 )
 
