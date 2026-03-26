@@ -148,7 +148,7 @@ def solve_equality_constraints(
         if np.max(np.abs(pos_err)) < tol:
             break
 
-        J = data.efc_J.reshape(nefc, model.nv)[eq_mask].copy()
+        J = data.efc_J.reshape(-1, model.nv)[:nefc][eq_mask].copy()
 
         # Zero out locked columns so the solver cannot move those DOFs.
         if locked_dofs:
