@@ -46,7 +46,7 @@ except Exception as exc:
 
 from .config import EditorConfig
 from .keyframe import Keyframe
-from .math_utils import interpolate_action, solve_equality_constraints
+from .math_utils import interpolate_action
 from .sim_worker import SimWorker
 
 
@@ -1276,9 +1276,8 @@ class ViserKeyframeEditor:
         raise ValueError(f"Could not find site or body named '{name}'")
 
     def _forward(self) -> None:
-        """Run forward kinematics and solve equality constraints at position level."""
+        """Run forward kinematics."""
         mujoco.mj_forward(self.model, self.data)
-        solve_equality_constraints(self.model, self.data)
 
     def _estimate_robot_height(self) -> float:
         """Estimate robot height from geom bounds in the current model state."""

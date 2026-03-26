@@ -395,9 +395,14 @@ class SimWorker(threading.Thread):
             self.data.joint(name).qpos = value
 
     def _forward(self, locked_joint_names: Optional[list[str]] = None) -> None:
-        """Run forward kinematics and solve equality constraints at position level."""
+        """Run forward kinematics, optionally solving equality constraints.
+
+        Constraint projection only runs when *locked_joint_names* is provided
+        (i.e. during slider dragging).  All other callers just need mj_forward.
+        """
         mujoco.mj_forward(self.model, self.data)
-        solve_equality_constraints(self.model, self.data, locked_joint_names=locked_joint_names)
+        if locked_joint_names is not None:
+            solve_equality_constraints(self.model, self.data, locked_joint_names=locked_joint_names)
 
     def _step(self) -> None:
         """Step physics simulation."""
