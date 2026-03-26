@@ -218,6 +218,7 @@ assets/mujoco_menagerie/
 dist/
 build/
 demo.mp4
+.vscode/
 
 # Keep examples in git (but exclude from PyPI package)
 # examples/demo.mp4

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "robot-keyframe-kit"
-version = "0.3.0"
+version = "0.3.1"
 description = "A generalizable Viser-based keyframe editor for any MuJoCo robot"
 readme = "README.md"
 license = "MIT"
@@ -64,9 +64,9 @@ robot_keyframe_kit = ["py.typed"]
 "*" = ["examples/*", "keyframes/*", "*.lz4", "*.stl", "*.dae"]
 
 [tool.black]
-line-length = 88
+line-length = 120
 target-version = ["py310"]
 
 [tool.ruff]
-line-length = 88
-select = ["E", "F", "I"]
+line-length = 120
+lint.select = ["E", "F", "I"]

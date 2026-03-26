@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 try:
@@ -48,9 +48,7 @@ class EditorConfig:
     # Note: Position-type actuators (like Unitree G1) use MuJoCo's built-in PD.
     kp: float = 12.0  # Position gain (proportional) - matches typical Dynamixel motors
     kd: float = 0.5  # Velocity gain (derivative) - light damping
-    motor_tau_limit: float = (
-        1.0  # Fallback |tau| clamp for torque actuators without model limits
-    )
+    motor_tau_limit: float = 1.0  # Fallback |tau| clamp for torque actuators without model limits
 
     # UI settings
     show_com: bool = True  # Show center of mass marker
@@ -59,12 +57,8 @@ class EditorConfig:
     root_pose_gizmo_scale: float = 0.35  # Base scale for root pose transform gizmo
     ik_target_gizmo_scale: float = 0.18  # Base scale for IK target transform gizmos
     auto_scale_gizmos: bool = True  # Scale gizmos based on robot model size
-    gizmo_scale_ratio: float = (
-        1.0  # Optional global multiplier applied after auto-scaling
-    )
-    gizmo_reference_height: float = (
-        1.28  # Height (m) where base gizmo scales are unchanged
-    )
+    gizmo_scale_ratio: float = 1.0  # Optional global multiplier applied after auto-scaling
+    gizmo_reference_height: float = 1.28  # Height (m) where base gizmo scales are unchanged
 
     # Scene generation settings
     auto_inject_floor: bool = True  # Whether to auto-inject floor for robot-only XMLs
@@ -85,10 +79,7 @@ class EditorConfig:
             FileNotFoundError: If the config file doesn't exist.
         """
         if yaml is None:
-            raise ImportError(
-                "PyYAML is required to load YAML config files. "
-                "Install with: pip install pyyaml"
-            )
+            raise ImportError("PyYAML is required to load YAML config files. Install with: pip install pyyaml")
 
         if not os.path.exists(path):
             raise FileNotFoundError(f"Config file not found: {path}")
@@ -174,10 +165,7 @@ class EditorConfig:
             ImportError: If PyYAML is not installed.
         """
         if yaml is None:
-            raise ImportError(
-                "PyYAML is required to save YAML config files. "
-                "Install with: pip install pyyaml"
-            )
+            raise ImportError("PyYAML is required to save YAML config files. Install with: pip install pyyaml")
 
         data = {
             "name": self.name,
@@ -212,16 +200,12 @@ class EditorConfig:
         # Remove None values
         data = {k: v for k, v in data.items() if v is not None}
 
-        os.makedirs(
-            os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True
-        )
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         with open(path, "w") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
     @classmethod
-    def generate_from_model(
-        cls, xml_path: str, name: Optional[str] = None
-    ) -> "EditorConfig":
+    def generate_from_model(cls, xml_path: str, name: Optional[str] = None) -> "EditorConfig":
         """Generate a configuration file from a MuJoCo model by auto-detecting settings.
 
         This creates a config with auto-detected values that can be manually edited.
@@ -262,9 +246,7 @@ class EditorConfig:
         for body_id in leaf_body_ids:
             for site_id in range(model.nsite):
                 if model.site_bodyid[site_id] == body_id:
-                    site_name = mujoco.mj_id2name(
-                        model, mujoco.mjtObj.mjOBJ_SITE, site_id
-                    )
+                    site_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, site_id)
                     if site_name:
                         end_effectors.append(site_name)
 
@@ -289,9 +271,7 @@ class EditorConfig:
         for joint_name in joint_names:
             if "left" in joint_name.lower() or "_l_" in joint_name.lower():
                 # Try to find corresponding right joint
-                right_name = joint_name.replace("left", "right").replace(
-                    "Left", "Right"
-                )
+                right_name = joint_name.replace("left", "right").replace("Left", "Right")
                 right_name_alt = joint_name.replace("_l_", "_r_").replace("_L_", "_R_")
 
                 if right_name in joint_names:

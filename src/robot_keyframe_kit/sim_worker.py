@@ -2,10 +2,6 @@
 
 This module contains the SimWorker class that handles physics simulation
 in a background thread, allowing the UI to remain responsive.
-
-NOTE: This file needs refactoring to work with raw MuJoCo model/data
-instead of the toddlerbot-specific MuJoCoSim and Robot classes.
-See PLAN.md for the required transformations.
 """
 
 from __future__ import annotations
@@ -20,6 +16,7 @@ from scipy.spatial.transform import Rotation as R
 
 from .config import EditorConfig
 from .keyframe import Keyframe
+from .math_utils import solve_equality_constraints
 
 
 class SimWorker(threading.Thread):
@@ -27,9 +24,6 @@ class SimWorker(threading.Thread):
 
     Handles physics simulation in a background thread, using threading
     instead of Qt. Use the provided lock to synchronize with the UI thread.
-
-    NOTE: This is adapted from the original toddlerbot implementation.
-    The sim/robot parameters have been replaced with raw MuJoCo model/data.
     """
 
     def __init__(
@@ -77,6 +71,7 @@ class SimWorker(threading.Thread):
 
         self.update_joint_angles_requested = False
         self.joint_angles_to_update = default_joint_angles.copy()
+        self.locked_joint_names: Optional[List[str]] = None
 
         self.update_qpos_requested = False
         # Start from current data state (editor may initialize from model home keyframe).
@@ -147,7 +142,6 @@ class SimWorker(threading.Thread):
 
         for act_id in range(self.model.nu):
             # Get actuator properties
-            trntype = self.model.actuator_trntype[act_id]
             dyntype = self.model.actuator_dyntype[act_id]
             gaintype = self.model.actuator_gaintype[act_id]
 
@@ -220,9 +214,7 @@ class SimWorker(threading.Thread):
         # Joint indices: from joint_names (UI-visible joints)
         joint_idx_list = []
         for joint_name in self.joint_names:
-            joint_id = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
-            )
+            joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
             if joint_id >= 0:
                 dof_adr = self.model.jnt_dofadr[joint_id]
                 rel_idx = dof_adr - self.qd_start_idx
@@ -235,9 +227,7 @@ class SimWorker(threading.Thread):
             flush=True,
         )
 
-    def _compute_pd_control(
-        self, targets: np.ndarray, debug: bool = False
-    ) -> np.ndarray:
+    def _compute_pd_control(self, targets: np.ndarray, debug: bool = False) -> np.ndarray:
         """Compute PD control for motor-type actuators.
 
         For position-controlled actuators, just pass through the target.
@@ -293,9 +283,7 @@ class SimWorker(threading.Thread):
         using_fallback = 0
 
         for act_id in range(self.model.nu):
-            if act_id >= len(self.actuator_is_motor) or (
-                not self.actuator_is_motor[act_id]
-            ):
+            if act_id >= len(self.actuator_is_motor) or (not self.actuator_is_motor[act_id]):
                 continue
 
             tau_lim = np.inf
@@ -406,9 +394,10 @@ class SimWorker(threading.Thread):
         for name, value in joint_angles.items():
             self.data.joint(name).qpos = value
 
-    def _forward(self) -> None:
-        """Run forward kinematics."""
+    def _forward(self, locked_joint_names: Optional[list[str]] = None) -> None:
+        """Run forward kinematics and solve equality constraints at position level."""
         mujoco.mj_forward(self.model, self.data)
+        solve_equality_constraints(self.model, self.data, locked_joint_names=locked_joint_names)
 
     def _step(self) -> None:
         """Step physics simulation."""
@@ -425,9 +414,14 @@ class SimWorker(threading.Thread):
         if self.on_state:
             self.on_state(motor_pos, joint_pos, qpos)
 
-    def update_joint_angles(self, joint_angles_to_update: Dict[str, float]):
+    def update_joint_angles(
+        self,
+        joint_angles_to_update: Dict[str, float],
+        locked_joint_names: Optional[List[str]] = None,
+    ):
         self.update_joint_angles_requested = True
         self.joint_angles_to_update = joint_angles_to_update.copy()
+        self.locked_joint_names = locked_joint_names
 
     def update_qpos(self, qpos: np.ndarray):
         self.update_qpos_requested = True
@@ -480,9 +474,7 @@ class SimWorker(threading.Thread):
             # Find sites attached to this body
             for site_id in range(self.model.nsite):
                 if self.model.site_bodyid[site_id] == body_id:
-                    site_name = mujoco.mj_id2name(
-                        self.model, mujoco.mjtObj.mjOBJ_SITE, site_id
-                    )
+                    site_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_SITE, site_id)
                     if not site_name:
                         continue
 
@@ -522,27 +514,17 @@ class SimWorker(threading.Thread):
             "calf",
             "shin",
         ]
-        has_arm_like_entry = any(
-            any(kw in entry.lower() for kw in arm_ee_keywords) for entry in ee_sites
-        )
-        has_leg_like_entry = any(
-            any(kw in entry.lower() for kw in leg_ee_keywords) for entry in ee_sites
-        )
+        has_arm_like_entry = any(any(kw in entry.lower() for kw in arm_ee_keywords) for entry in ee_sites)
+        has_leg_like_entry = any(any(kw in entry.lower() for kw in leg_ee_keywords) for entry in ee_sites)
         if not has_arm_like_entry or not has_leg_like_entry:
             existing = {entry.lower() for entry in ee_sites}
             for body_id in leaf_body_ids:
-                body_name = mujoco.mj_id2name(
-                    self.model, mujoco.mjtObj.mjOBJ_BODY, body_id
-                )
+                body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
                 if body_name is None or body_name == "world":
                     continue
                 body_lower = body_name.lower()
-                arm_match = (not has_arm_like_entry) and any(
-                    kw in body_lower for kw in arm_ee_keywords
-                )
-                leg_match = (not has_leg_like_entry) and any(
-                    kw in body_lower for kw in leg_ee_keywords
-                )
+                arm_match = (not has_arm_like_entry) and any(kw in body_lower for kw in arm_ee_keywords)
+                leg_match = (not has_leg_like_entry) and any(kw in body_lower for kw in leg_ee_keywords)
                 if arm_match or leg_match:
                     if body_lower not in existing:
                         ee_sites.append(body_name)
@@ -562,9 +544,7 @@ class SimWorker(threading.Thread):
                 "gripper",
             ]
             for body_id in leaf_body_ids:
-                body_name = mujoco.mj_id2name(
-                    self.model, mujoco.mjtObj.mjOBJ_BODY, body_id
-                )
+                body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
                 if body_name is None or body_name == "world":
                     continue
                 # Check if body name contains any end-effector keywords
@@ -575,9 +555,7 @@ class SimWorker(threading.Thread):
             # If still no matches, just use all leaf bodies
             if not ee_sites:
                 for body_id in leaf_body_ids:
-                    body_name = mujoco.mj_id2name(
-                        self.model, mujoco.mjtObj.mjOBJ_BODY, body_id
-                    )
+                    body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
                     if body_name and body_name != "world":
                         ee_sites.append(body_name)
 
@@ -598,10 +576,7 @@ class SimWorker(threading.Thread):
 
         for geom_id in range(self.model.ngeom):
             # Ignore purely visual geoms that never participate in collisions.
-            if (
-                int(self.model.geom_contype[geom_id]) == 0
-                and int(self.model.geom_conaffinity[geom_id]) == 0
-            ):
+            if int(self.model.geom_contype[geom_id]) == 0 and int(self.model.geom_conaffinity[geom_id]) == 0:
                 continue
 
             # Get geom type and size
@@ -680,9 +655,7 @@ class SimWorker(threading.Thread):
                     return
 
                 lowest_z = site_z_min
-                print(
-                    f"[Ground] Using site {min_site} at z={lowest_z:.4f}m", flush=True
-                )
+                print(f"[Ground] Using site {min_site} at z={lowest_z:.4f}m", flush=True)
 
             # Move the robot so the lowest point is at z=0
             dz = lowest_z
@@ -690,9 +663,7 @@ class SimWorker(threading.Thread):
             aligned_torso_t[2, 3] -= dz
 
             self.data.qpos[:3] = aligned_torso_t[:3, 3]
-            self.data.qpos[3:7] = R.from_matrix(aligned_torso_t[:3, :3]).as_quat(
-                scalar_first=True
-            )
+            self.data.qpos[3:7] = R.from_matrix(aligned_torso_t[:3, :3]).as_quat(scalar_first=True)
             self._forward()
             print(
                 f"[Ground] Placed robot on ground (moved down {dz:.4f}m, lowest geom was at z={lowest_z:.4f}m)",
@@ -776,7 +747,8 @@ class SimWorker(threading.Thread):
 
             try:
                 print(
-                    f"[Viser] Worker: start trajectory test: len={len(traj)}, dt={dt}, physics={physics_enabled}, qpos={is_qpos_traj}, rel={is_relative_frame}",
+                    f"[Viser] Worker: start trajectory test: len={len(traj)}, dt={dt}, "
+                    f"physics={physics_enabled}, qpos={is_qpos_traj}, rel={is_relative_frame}",
                     flush=True,
                 )
             except Exception:
@@ -818,7 +790,7 @@ class SimWorker(threading.Thread):
                     joint_angles = self._get_joint_angles()
                     joint_angles.update(self.joint_angles_to_update)
                     self._set_joint_angles(joint_angles)
-                    self._forward()
+                    self._forward(self.locked_joint_names)
                     self.update_joint_angles_requested = False
                 time.sleep(0)  # yield
                 continue
@@ -842,9 +814,7 @@ class SimWorker(threading.Thread):
                         for _ in range(n_substeps):
                             # Compute PD control for motor actuators
                             if self.keyframe_motor_target is not None:
-                                ctrl = self._compute_pd_control(
-                                    self.keyframe_motor_target
-                                )
+                                ctrl = self._compute_pd_control(self.keyframe_motor_target)
                                 self.data.ctrl[:] = ctrl
                             self._step()
                         self.keyframe_test_counter += 1
@@ -863,7 +833,8 @@ class SimWorker(threading.Thread):
                 if current_counter == 0:
                     try:
                         print(
-                            f"[Viser] Worker: stepping trajectory... len={traj_len}, dt={self.traj_test_dt}, physics={self.traj_physics_enabled}",
+                            f"[Viser] Worker: stepping trajectory... len={traj_len}, "
+                            f"dt={self.traj_test_dt}, physics={self.traj_physics_enabled}",
                             flush=True,
                         )
                     except Exception:
@@ -968,10 +939,7 @@ class SimWorker(threading.Thread):
                     # Compute motor and joint velocities
                     # For qpos trajectory (no physics): use mj_differentiatePos
                     # For action trajectory with physics: use qvel directly
-                    if (
-                        self.is_qpos_traj
-                        and current_counter < len(self.action_traj) - 1
-                    ):
+                    if self.is_qpos_traj and current_counter < len(self.action_traj) - 1:
                         # Qpos trajectory: compute qvel from consecutive frames
                         current_qpos = self.action_traj[current_counter]
                         next_qpos = self.action_traj[current_counter + 1]
@@ -985,36 +953,26 @@ class SimWorker(threading.Thread):
                         )
                         # Extract motor and joint velocities from computed qvel
                         if len(self.motor_indices) > 0:
-                            motor_vel_data = qvel_computed[
-                                self.qd_start_idx + self.motor_indices
-                            ].astype(np.float32)
+                            motor_vel_data = qvel_computed[self.qd_start_idx + self.motor_indices].astype(np.float32)
                         else:
                             motor_vel_data = np.array([], dtype=np.float32)
                         if len(self.joint_indices) > 0:
-                            joint_vel_data = qvel_computed[
-                                self.qd_start_idx + self.joint_indices
-                            ].astype(np.float32)
+                            joint_vel_data = qvel_computed[self.qd_start_idx + self.joint_indices].astype(np.float32)
                         else:
                             joint_vel_data = np.array([], dtype=np.float32)
                     else:
                         # Action trajectory or last frame: use qvel from simulation
                         if len(self.motor_indices) > 0:
-                            motor_vel_data = self.data.qvel[
-                                self.qd_start_idx + self.motor_indices
-                            ].astype(np.float32)
+                            motor_vel_data = self.data.qvel[self.qd_start_idx + self.motor_indices].astype(np.float32)
                         else:
                             motor_vel_data = np.array([], dtype=np.float32)
                         if len(self.joint_indices) > 0:
-                            joint_vel_data = self.data.qvel[
-                                self.qd_start_idx + self.joint_indices
-                            ].astype(np.float32)
+                            joint_vel_data = self.data.qvel[self.qd_start_idx + self.joint_indices].astype(np.float32)
                         else:
                             joint_vel_data = np.array([], dtype=np.float32)
 
                     root_body = self.config.root_body
-                    torso_rot = R.from_quat(
-                        self.data.body(root_body).xquat.copy(), scalar_first=True
-                    )
+                    torso_rot = R.from_quat(self.data.body(root_body).xquat.copy(), scalar_first=True)
                     r_inv = torso_rot.inv()
 
                     if self.is_relative_frame:
@@ -1025,22 +983,14 @@ class SimWorker(threading.Thread):
                         for i in range(self.model.nbody):
                             p = body_pos_world[i]
                             q = body_quat_world[i]
-                            body_pos.append(
-                                r_inv.apply(p - self.data.body(root_body).xpos)
-                            )
+                            body_pos.append(r_inv.apply(p - self.data.body(root_body).xpos))
                             # Convert world quat to torso-relative by q_rel = q_inv(torso)*q_body
-                            q_rel = (r_inv * R.from_quat(q, scalar_first=True)).as_quat(
-                                scalar_first=True
-                            )
+                            q_rel = (r_inv * R.from_quat(q, scalar_first=True)).as_quat(scalar_first=True)
                             body_quat.append(q_rel)
                         body_pos = np.array(body_pos, dtype=np.float32)
                         body_quat = np.array(body_quat, dtype=np.float32)
-                        body_lin_vel_world = np.array(
-                            self.data.cvel[:, 3:], dtype=np.float32
-                        )
-                        body_ang_vel_world = np.array(
-                            self.data.cvel[:, :3], dtype=np.float32
-                        )
+                        body_lin_vel_world = np.array(self.data.cvel[:, 3:], dtype=np.float32)
+                        body_ang_vel_world = np.array(self.data.cvel[:, :3], dtype=np.float32)
                         body_lin_vel = r_inv.apply(body_lin_vel_world)
                         body_ang_vel = r_inv.apply(body_ang_vel_world)
 
@@ -1052,9 +1002,7 @@ class SimWorker(threading.Thread):
                                 try:
                                     ee_pos_world = self.data.site(sname).xpos.copy()
                                     ee_mat = self.data.site(sname).xmat.reshape(3, 3)
-                                    ee_quat_world = R.from_matrix(ee_mat).as_quat(
-                                        scalar_first=True
-                                    )
+                                    ee_quat_world = R.from_matrix(ee_mat).as_quat(scalar_first=True)
                                     site_pos.append(ee_pos_world)
                                     site_quat.append(ee_quat_world)
                                 except Exception:
@@ -1071,9 +1019,7 @@ class SimWorker(threading.Thread):
                                 try:
                                     ee_pos_world = self.data.site(sname).xpos.copy()
                                     ee_mat = self.data.site(sname).xmat.reshape(3, 3)
-                                    ee_quat_world = R.from_matrix(ee_mat).as_quat(
-                                        scalar_first=True
-                                    )
+                                    ee_quat_world = R.from_matrix(ee_mat).as_quat(scalar_first=True)
                                     site_pos.append(ee_pos_world)
                                     site_quat.append(ee_quat_world)
                                 except Exception:
@@ -1088,23 +1034,15 @@ class SimWorker(threading.Thread):
                 self.body_lin_vel_replay.append(body_lin_vel)
                 self.body_ang_vel_replay.append(body_ang_vel)
                 self.site_pos_replay.append(
-                    np.array(site_pos, dtype=np.float32)
-                    if site_pos
-                    else np.array([], dtype=np.float32)
+                    np.array(site_pos, dtype=np.float32) if site_pos else np.array([], dtype=np.float32)
                 )
                 self.site_quat_replay.append(
-                    np.array(site_quat, dtype=np.float32)
-                    if site_quat
-                    else np.array([], dtype=np.float32)
+                    np.array(site_quat, dtype=np.float32) if site_quat else np.array([], dtype=np.float32)
                 )
 
                 self.traj_test_counter += 1
                 try:
-                    if (
-                        self.traj_test_counter
-                        % max(1, int(0.5 / max(self.traj_test_dt, 1e-6)))
-                        == 0
-                    ):
+                    if self.traj_test_counter % max(1, int(0.5 / max(self.traj_test_dt, 1e-6))) == 0:
                         print(
                             f"[Viser] Worker: progressed to step {self.traj_test_counter}/{traj_len}",
                             flush=True,

@@ -3,9 +3,6 @@
 This module provides a web-based keyframe editor using Viser for visualization
 and MuJoCo for physics simulation. It works directly with MuJoCo XML files
 without requiring any robot-specific wrapper classes.
-
-NOTE: This file is adapted from the toddlerbot implementation.
-The sim/robot parameters have been replaced with direct MuJoCo usage.
 """
 
 from __future__ import annotations
@@ -14,12 +11,11 @@ import argparse
 import json
 import os
 import re
-import shutil
 import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import joblib
 import mujoco
@@ -31,9 +27,7 @@ try:
     from viser import GuiEvent
 except Exception as exc:
     raise ImportError(
-        "Viser is required for the keyframe editor.\n"
-        "Install with: pip install viser\n"
-        f"Original import error: {exc}"
+        f"Viser is required for the keyframe editor.\nInstall with: pip install viser\nOriginal import error: {exc}"
     ) from exc
 
 try:
@@ -52,7 +46,7 @@ except Exception as exc:
 
 from .config import EditorConfig
 from .keyframe import Keyframe
-from .math_utils import interpolate_action
+from .math_utils import interpolate_action, solve_equality_constraints
 from .sim_worker import SimWorker
 
 
@@ -91,9 +85,7 @@ class ViserKeyframeEditor:
         self.config = config
         self.xml_path = os.path.abspath(xml_path)
         self.dt = config.dt
-        # Start-keyframe CLI plumbing is temporarily disabled for public release.
         self.start_keyframe = None
-        # self.start_keyframe = start_keyframe
         self.root_pose_gizmo_scale = float(config.root_pose_gizmo_scale)
         self.ik_target_gizmo_scale = float(config.ik_target_gizmo_scale)
 
@@ -113,9 +105,7 @@ class ViserKeyframeEditor:
 
         # Maps motion joint -> tendon info for inverse computation
         # Structure: motion_joint -> (tendon_name, [(motor_joint, motor_coef), ...], motion_coef)
-        self.differential_drives: Dict[
-            str, Tuple[str, List[Tuple[str, float]], float]
-        ] = {}
+        self.differential_drives: Dict[str, Tuple[str, List[Tuple[str, float]], float]] = {}
 
         # Initialize coupling dictionaries
         self.joint_couplings: Dict[str, Tuple[str, float, float]] = {}
@@ -159,28 +149,13 @@ class ViserKeyframeEditor:
         os.makedirs(self.result_dir, exist_ok=True)
         self.data_path = data_path
 
-        # Screenshot-only UI and camera-pose workflow are temporarily disabled
-        # for public release. Keep these paths for internal use later.
         self.joint_sliders_only = False
-        self.camera_pose_path = os.path.abspath(
-            os.path.join(config.save_dir, "_camera_pose.json")
-        )
+        self.camera_pose_path = os.path.abspath(os.path.join(config.save_dir, "_camera_pose.json"))
         self._latest_camera_pose: Optional[Dict[str, object]] = None
         self._last_camera_pose_autosave_ts = 0.0
 
-        # mode_env = os.getenv("RKF_JOINT_SLIDERS_ONLY", "").strip().lower()
-        # self.joint_sliders_only = mode_env in {"1", "true", "yes", "on"}
-        # camera_pose_env = os.getenv("RKF_CAMERA_POSE_PATH", "").strip()
-        # self.camera_pose_path = (
-        #     os.path.abspath(camera_pose_env)
-        #     if camera_pose_env
-        #     else os.path.abspath(os.path.join(config.save_dir, "_camera_pose.json"))
-        # )
-
         # Mirror configuration - can be customized via config, then auto-computed
-        self.mirror_joint_signs = (
-            config.mirror_signs.copy() if config.mirror_signs else {}
-        )
+        self.mirror_joint_signs = config.mirror_signs.copy() if config.mirror_signs else {}
         self._compute_mirror_signs()  # Auto-compute based on joint axis orientations
 
         # State
@@ -232,9 +207,7 @@ class ViserKeyframeEditor:
         self._mesh_quat_map: Dict[str, Tuple[float, float, float, float]] = {}
         self._com_sphere: Optional[object] = None
         self._scene_updater: Optional[threading.Thread] = None
-        scene_hz = max(
-            15.0, min(120.0, float(getattr(config, "scene_update_hz", 60.0)))
-        )
+        scene_hz = max(15.0, min(120.0, float(getattr(config, "scene_update_hz", 60.0))))
         self._scene_update_dt = 1.0 / scene_hz
 
         # GUI bookkeeping
@@ -329,12 +302,6 @@ class ViserKeyframeEditor:
                 if key == "t":
                     self._toggle_ik_targets()
                     return
-                # Screenshot/camera-pose workflow hotkeys are disabled for public release.
-                # if key == "c":
-                #     self._print_latest_camera_pose()
-                #     return
-                # if key == "v":
-                #     self._save_latest_camera_pose(verbose=True)
 
         try:
             mujoco.mj_forward(self.model, self.data)
@@ -367,20 +334,13 @@ class ViserKeyframeEditor:
                     position=(0.0, 0.0, 0.0),
                 )
                 for body_index in range(self.model.nbody):
-                    name = (
-                        mujoco.mj_id2name(
-                            self.model, mujoco.mjtObj.mjOBJ_BODY, body_index
-                        )
-                        or f"body_{body_index}"
-                    )
+                    name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_index) or f"body_{body_index}"
                     try:
-                        self._scene_handles[f"body_{body_index}"] = (
-                            self.server.scene.add_icosphere(
-                                f"/robot/bodies/{body_index:04d}_{name}",
-                                radius=0.02,
-                                position=(0.0, 0.0, 0.0),
-                                color=(0.7, 0.7, 0.7),
-                            )
+                        self._scene_handles[f"body_{body_index}"] = self.server.scene.add_icosphere(
+                            f"/robot/bodies/{body_index:04d}_{name}",
+                            radius=0.02,
+                            position=(0.0, 0.0, 0.0),
+                            color=(0.7, 0.7, 0.7),
                         )
                     except Exception:
                         continue
@@ -420,9 +380,7 @@ class ViserKeyframeEditor:
         try:
             q_home = np.array(self.model.keyframe("home").qpos, dtype=np.float32)
             if q_home.shape[0] == self.model.nq:
-                print(
-                    "[Viser] Using model keyframe 'home' as startup pose.", flush=True
-                )
+                print("[Viser] Using model keyframe 'home' as startup pose.", flush=True)
                 return q_home
         except Exception:
             pass
@@ -430,9 +388,7 @@ class ViserKeyframeEditor:
         # 2) Fall back to first keyframe if present.
         if self.model.nkey > 0:
             try:
-                key_qpos = np.array(self.model.key_qpos, dtype=np.float32).reshape(
-                    self.model.nkey, self.model.nq
-                )
+                key_qpos = np.array(self.model.key_qpos, dtype=np.float32).reshape(self.model.nkey, self.model.nq)
                 q0 = key_qpos[0].copy()
                 key0_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_KEY, 0)
                 if key0_name:
@@ -472,12 +428,8 @@ class ViserKeyframeEditor:
         ) in self.parallel_linkages_inverse.items():
             if abs(float(ratio)) <= 1e-8:
                 continue
-            motion_id = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_JOINT, motion_joint
-            )
-            motor_id = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_JOINT, motor_joint
-            )
+            motion_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, motion_joint)
+            motor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, motor_joint)
             if motion_id < 0 or motor_id < 0:
                 continue
             motion_adr = int(self.model.jnt_qposadr[motion_id])
@@ -486,17 +438,13 @@ class ViserKeyframeEditor:
 
         # 2) Motor -> passive rods for visual/kinematic consistency.
         for motor_joint, rod_specs in self.passive_rod_joints.items():
-            motor_id = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_JOINT, motor_joint
-            )
+            motor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, motor_joint)
             if motor_id < 0:
                 continue
             motor_adr = int(self.model.jnt_qposadr[motor_id])
             motor_val = float(q[motor_adr])
             for rod_joint, ratio in rod_specs:
-                rod_id = mujoco.mj_name2id(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, rod_joint
-                )
+                rod_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, rod_joint)
                 if rod_id < 0:
                     continue
                 rod_adr = int(self.model.jnt_qposadr[rod_id])
@@ -520,10 +468,7 @@ class ViserKeyframeEditor:
                 self.data.qvel[:] = 0
                 mujoco.mj_forward(self.model, self.data)
                 motor_pos = np.array(
-                    [
-                        self.data.actuator(name).length.item()
-                        for name in self.actuator_names
-                    ],
+                    [self.data.actuator(name).length.item() for name in self.actuator_names],
                     dtype=np.float32,
                 )
             finally:
@@ -624,25 +569,15 @@ class ViserKeyframeEditor:
                 wrap_idx = adr + i
                 obj_id = self.model.wrap_objid[wrap_idx]
                 coef = float(self.model.wrap_prm[wrap_idx])
-                joint_name = mujoco.mj_id2name(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id
-                )
+                joint_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id)
                 if joint_name:
                     joints_in_tendon.append((joint_name, coef, obj_id))
 
             if len(joints_in_tendon) < 2:
                 continue
 
-            motor_joints = [
-                (n, c, jid)
-                for n, c, jid in joints_in_tendon
-                if jid in actuated_joint_ids
-            ]
-            motion_joints = [
-                (n, c, jid)
-                for n, c, jid in joints_in_tendon
-                if jid not in actuated_joint_ids
-            ]
+            motor_joints = [(n, c, jid) for n, c, jid in joints_in_tendon if jid in actuated_joint_ids]
+            motion_joints = [(n, c, jid) for n, c, jid in joints_in_tendon if jid not in actuated_joint_ids]
 
             # Differential drive: multiple motors -> single motion
             if len(motor_joints) >= 2 and len(motion_joints) == 1:
@@ -696,22 +631,12 @@ class ViserKeyframeEditor:
                 wrap_idx = adr + i
                 obj_id = self.model.wrap_objid[wrap_idx]
                 coef = float(self.model.wrap_prm[wrap_idx])
-                joint_name = mujoco.mj_id2name(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id
-                )
+                joint_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id)
                 if joint_name:
                     joints_in_tendon.append((joint_name, coef, obj_id))
 
-            motor_joints = [
-                (n, c, jid)
-                for n, c, jid in joints_in_tendon
-                if jid in actuated_joint_ids
-            ]
-            motion_joints = [
-                (n, c, jid)
-                for n, c, jid in joints_in_tendon
-                if jid not in actuated_joint_ids
-            ]
+            motor_joints = [(n, c, jid) for n, c, jid in joints_in_tendon if jid in actuated_joint_ids]
+            motion_joints = [(n, c, jid) for n, c, jid in joints_in_tendon if jid not in actuated_joint_ids]
 
             # Add motion joints for differential drives
             if len(motor_joints) >= 2 and len(motion_joints) == 1:
@@ -727,9 +652,7 @@ class ViserKeyframeEditor:
                         self.joint_limits[motion_name] = (-3.14159, 3.14159)
                     # Get default position
                     qpos_adr = self.model.jnt_qposadr[motion_jid]
-                    self.default_positions[motion_name] = float(
-                        self.model.qpos0[qpos_adr]
-                    )
+                    self.default_positions[motion_name] = float(self.model.qpos0[qpos_adr])
 
         # Third pass: add driven joints for gear mechanisms (replace drive joints)
         for driven_name, (
@@ -738,9 +661,7 @@ class ViserKeyframeEditor:
             ratio,
         ) in self.joint_couplings_inverse.items():
             if driven_name not in self.joint_names:
-                driven_id = mujoco.mj_name2id(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, driven_name
-                )
+                driven_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, driven_name)
                 if driven_id >= 0:
                     self.joint_names.append(driven_name)
                     # Get joint limits from the driven joint
@@ -752,16 +673,12 @@ class ViserKeyframeEditor:
                         self.joint_limits[driven_name] = (-3.14159, 3.14159)
                     # Get default position
                     qpos_adr = self.model.jnt_qposadr[driven_id]
-                    self.default_positions[driven_name] = float(
-                        self.model.qpos0[qpos_adr]
-                    )
+                    self.default_positions[driven_name] = float(self.model.qpos0[qpos_adr])
 
         # Fourth pass: add motion joints for parallel linkages (replace motor joints)
         for motion_name, (motor_name, ratio) in self.parallel_linkages_inverse.items():
             if motion_name not in self.joint_names:
-                motion_id = mujoco.mj_name2id(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, motion_name
-                )
+                motion_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, motion_name)
                 if motion_id >= 0:
                     self.joint_names.append(motion_name)
                     # Get joint limits from the motion joint
@@ -773,9 +690,7 @@ class ViserKeyframeEditor:
                         self.joint_limits[motion_name] = (-3.14159, 3.14159)
                     # Get default position
                     qpos_adr = self.model.jnt_qposadr[motion_id]
-                    self.default_positions[motion_name] = float(
-                        self.model.qpos0[qpos_adr]
-                    )
+                    self.default_positions[motion_name] = float(self.model.qpos0[qpos_adr])
 
         # Discover actuators
         for i in range(self.model.nu):
@@ -811,12 +726,8 @@ class ViserKeyframeEditor:
                 if drive_id < 0:
                     continue
 
-                driven_name = mujoco.mj_id2name(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, driven_id
-                )
-                drive_name = mujoco.mj_id2name(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, drive_id
-                )
+                driven_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, driven_id)
+                drive_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, drive_id)
 
                 if driven_name and drive_name:
                     # eq_data: [polycoef[0], polycoef[1], ...] where driven = polycoef[0] + polycoef[1] * drive
@@ -859,9 +770,7 @@ class ViserKeyframeEditor:
 
         # Analyze each tendon to find differential drives
         for tendon_id in range(self.model.ntendon):
-            tendon_name = mujoco.mj_id2name(
-                self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id
-            )
+            tendon_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id)
             if tendon_name is None:
                 continue
 
@@ -872,15 +781,12 @@ class ViserKeyframeEditor:
             joints_in_tendon = []
             for i in range(num):
                 wrap_idx = adr + i
-                wrap_type = self.model.wrap_type[wrap_idx]
                 obj_id = self.model.wrap_objid[wrap_idx]
                 coef = float(self.model.wrap_prm[wrap_idx])
 
                 # For fixed tendons, obj_id refers to joint ID (even if wrap_type is pulley)
                 joint_id = obj_id
-                joint_name = mujoco.mj_id2name(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_id
-                )
+                joint_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
 
                 if joint_name:
                     joints_in_tendon.append((joint_name, coef, joint_id))
@@ -932,10 +838,7 @@ class ViserKeyframeEditor:
                 actuated_joint_ids.add(trnid[0])
 
         # Check for CONNECT constraints (indicate closed-loop mechanisms)
-        has_connect = any(
-            self.model.eq_type[eq_id] == mujoco.mjtEq.mjEQ_CONNECT
-            for eq_id in range(self.model.neq)
-        )
+        has_connect = any(self.model.eq_type[eq_id] == mujoco.mjtEq.mjEQ_CONNECT for eq_id in range(self.model.neq))
 
         if not has_connect:
             return
@@ -948,9 +851,7 @@ class ViserKeyframeEditor:
             if jnt_id not in actuated_joint_ids:
                 continue
 
-            motor_name = mujoco.mj_id2name(
-                self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id
-            )
+            motor_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id)
             motor_body_id = self.model.jnt_bodyid[jnt_id]
             parent_body_id = self.model.body_parentid[motor_body_id]
 
@@ -964,17 +865,11 @@ class ViserKeyframeEditor:
                 if self.model.jnt_bodyid[other_jnt_id] != parent_body_id:
                     continue
 
-                motion_name = mujoco.mj_id2name(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, other_jnt_id
-                )
+                motion_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, other_jnt_id)
 
                 # Check if they have similar names (e.g., neck_pitch_act and neck_pitch)
                 # Motor name should contain motion name or vice versa
-                motor_base = (
-                    motor_name.replace("_act", "")
-                    .replace("_drive", "")
-                    .replace("_motor", "")
-                )
+                motor_base = motor_name.replace("_act", "").replace("_drive", "").replace("_motor", "")
                 motion_base = motion_name
 
                 if motor_base == motion_base or motion_base in motor_name:
@@ -1021,9 +916,7 @@ class ViserKeyframeEditor:
             if jnt_id not in actuated_joint_ids:
                 continue
 
-            motor_name = mujoco.mj_id2name(
-                self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id
-            )
+            motor_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id)
             if not motor_name:
                 continue
 
@@ -1038,9 +931,7 @@ class ViserKeyframeEditor:
             rod_joints = []
             for suffix in ["_front", "_back"]:
                 rod_name = base_name + suffix
-                rod_id = mujoco.mj_name2id(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, rod_name
-                )
+                rod_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, rod_name)
                 if rod_id >= 0:
                     # Rod rotates opposite to motor (approximation for parallel linkage)
                     rod_joints.append((rod_name, -1.0))
@@ -1111,12 +1002,8 @@ class ViserKeyframeEditor:
                 continue
 
             # Get joint IDs
-            jnt_id = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
-            )
-            partner_id = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_JOINT, partner
-            )
+            jnt_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+            partner_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, partner)
 
             if jnt_id < 0 or partner_id < 0:
                 continue
@@ -1160,9 +1047,7 @@ class ViserKeyframeEditor:
             processed.add(joint_name)
             processed.add(partner)
 
-    def _load_model_with_ground(
-        self, xml_path: str
-    ) -> Tuple[mujoco.MjModel, mujoco.MjData]:
+    def _load_model_with_ground(self, xml_path: str) -> Tuple[mujoco.MjModel, mujoco.MjData]:
         """Load a MuJoCo model, ensuring it has a ground plane for physics simulation.
 
         If the model doesn't have a floor/plane geom in worldbody, one is added
@@ -1229,9 +1114,7 @@ class ViserKeyframeEditor:
             tree = ET.parse(xml_path)
             root = tree.getroot()
 
-            # Check if this is a scene file (has worldbody with content) or robot-only
             worldbody = root.find("worldbody")
-            is_robot_only = worldbody is None or len(worldbody) == 0
 
             if worldbody is None:
                 worldbody = ET.SubElement(root, "worldbody")
@@ -1306,9 +1189,7 @@ class ViserKeyframeEditor:
                 worldbody.insert(0, floor_geom)
 
             # Write to a temp file in the same directory (so relative asset paths work)
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".xml", dir=xml_dir, delete=False
-            ) as tmp_file:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", dir=xml_dir, delete=False) as tmp_file:
                 tree.write(tmp_file.name, encoding="unicode")
                 tmp_path = tmp_file.name
 
@@ -1349,9 +1230,7 @@ class ViserKeyframeEditor:
                 name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
                 if name and name != "world":
                     return name
-        raise ValueError(
-            "Could not auto-detect root body: no non-world body found as direct child of world"
-        )
+        raise ValueError("Could not auto-detect root body: no non-world body found as direct child of world")
 
     # ----- Helper methods for raw MuJoCo -----
     def _get_body_transform(self, body_name: str) -> np.ndarray:
@@ -1397,8 +1276,9 @@ class ViserKeyframeEditor:
         raise ValueError(f"Could not find site or body named '{name}'")
 
     def _forward(self) -> None:
-        """Run forward kinematics."""
+        """Run forward kinematics and solve equality constraints at position level."""
         mujoco.mj_forward(self.model, self.data)
+        solve_equality_constraints(self.model, self.data)
 
     def _estimate_robot_height(self) -> float:
         """Estimate robot height from geom bounds in the current model state."""
@@ -1488,9 +1368,7 @@ class ViserKeyframeEditor:
         except Exception:
             return None
 
-    def _apply_camera_pose(
-        self, client: viser.ClientHandle, pose: Dict[str, object]
-    ) -> None:
+    def _apply_camera_pose(self, client: viser.ClientHandle, pose: Dict[str, object]) -> None:
         """Apply a camera pose dict to a connected client."""
         pos = tuple(float(x) for x in pose.get("position", [1.5, -0.5, 0.55]))
         look_at = tuple(float(x) for x in pose.get("look_at", [0.0, 0.0, 0.25]))
@@ -1526,25 +1404,6 @@ class ViserKeyframeEditor:
             print(f"[Viser] Failed to load camera pose file: {exc}", flush=True)
             return None
 
-    def _print_latest_camera_pose(self) -> None:
-        """Print latest camera pose as JSON for easy reuse."""
-        pose = self._latest_camera_pose
-        if pose is None:
-            clients = self.server.get_clients()
-            if clients:
-                first_client = next(iter(clients.values()))
-                pose = self._camera_pose_from_handle(first_client.camera)
-                if pose is not None:
-                    self._latest_camera_pose = pose
-        if pose is None:
-            print(
-                "[Viser] Camera pose unavailable yet; move camera once and try again.",
-                flush=True,
-            )
-            return
-        print("[Viser] Camera pose JSON:", flush=True)
-        print(json.dumps(pose, indent=2), flush=True)
-
     def _save_latest_camera_pose(self, *, verbose: bool = True) -> bool:
         """Save latest camera pose to configured JSON path."""
         pose = self._latest_camera_pose
@@ -1568,9 +1427,7 @@ class ViserKeyframeEditor:
             with open(self.camera_pose_path, "w", encoding="utf-8") as f:
                 json.dump(pose, f, indent=2)
             if verbose:
-                print(
-                    f"[Viser] Saved camera pose to: {self.camera_pose_path}", flush=True
-                )
+                print(f"[Viser] Saved camera pose to: {self.camera_pose_path}", flush=True)
             return True
         except Exception as exc:
             if verbose:
@@ -1757,9 +1614,7 @@ class ViserKeyframeEditor:
                     event = str(payload.get("event", "select"))
                     selected = self._payload_index(payload.get("selected_index"))
                     if event == "rename":
-                        idx = self._payload_index(
-                            payload.get("index"), fallback=selected
-                        )
+                        idx = self._payload_index(payload.get("index"), fallback=selected)
                         text = str(payload.get("text", "")).strip()
                         self._rename_keyframe(idx, text)
                     elif event == "reorder":
@@ -1793,12 +1648,8 @@ class ViserKeyframeEditor:
                         dst_idx = self._payload_index(payload.get("dst_index"))
                         self._reorder_sequence(src_idx, dst_idx)
                     elif event == "rename":
-                        idx = self._payload_index(
-                            payload.get("index"), fallback=selected
-                        )
-                        new_time = self._parse_sequence_time_text(
-                            str(payload.get("text", ""))
-                        )
+                        idx = self._payload_index(payload.get("index"), fallback=selected)
+                        new_time = self._parse_sequence_time_text(str(payload.get("text", "")))
                         if new_time is not None:
                             self._edit_sequence_time(idx, new_time)
                     elif 0 <= selected < len(self.sequence_list):
@@ -1854,10 +1705,7 @@ class ViserKeyframeEditor:
 
                 @self.keyframe_name_input.on_update
                 def _(ev: GuiEvent) -> None:
-                    if (
-                        id(ev.target) in self._updating_handles
-                        or self.selected_keyframe is None
-                    ):
+                    if id(ev.target) in self._updating_handles or self.selected_keyframe is None:
                         return
                     new_name = str(self.keyframe_name_input.value).strip()
                     self._rename_keyframe(self.selected_keyframe, new_name)
@@ -1907,10 +1755,7 @@ class ViserKeyframeEditor:
 
                 @self.sequence_time_input.on_update
                 def _(ev: GuiEvent) -> None:
-                    if (
-                        id(ev.target) in self._updating_handles
-                        or self.selected_sequence is None
-                    ):
+                    if id(ev.target) in self._updating_handles or self.selected_sequence is None:
                         return
                     try:
                         new_t = float(str(self.sequence_time_input.value))
@@ -2169,10 +2014,7 @@ class ViserKeyframeEditor:
             self.root_slider_widgets["yaw"] = yaw_slider
 
             def update_root_pose(_event: GuiEvent) -> None:
-                if any(
-                    id(s) in self._updating_handles
-                    for s in self.root_slider_widgets.values()
-                ):
+                if any(id(s) in self._updating_handles for s in self.root_slider_widgets.values()):
                     return
                 self._apply_root_pose_from_sliders()
 
@@ -2199,10 +2041,7 @@ class ViserKeyframeEditor:
             return
 
         # Sliders-only UI mode does not build the checkbox, so toggle directly.
-        currently_enabled = bool(
-            self.root_pose_gizmo is not None
-            and getattr(self.root_pose_gizmo, "visible", False)
-        )
+        currently_enabled = bool(self.root_pose_gizmo is not None and getattr(self.root_pose_gizmo, "visible", False))
         self._set_root_gizmo_enabled(not currently_enabled)
 
     def _set_root_gizmo_enabled(self, enabled: bool) -> None:
@@ -2387,9 +2226,7 @@ class ViserKeyframeEditor:
     def _build_robot_meshes(self) -> None:
         """Populate `self._geom_handles` with MuJoCo meshes."""
         if trimesh is None:
-            print(
-                "[Viser] trimesh not installed, skipping mesh visualization", flush=True
-            )
+            print("[Viser] trimesh not installed, skipping mesh visualization", flush=True)
             return
 
         self._geom_handles.clear()
@@ -2436,11 +2273,7 @@ class ViserKeyframeEditor:
                 for inc in root.findall(".//include"):
                     inc_file = inc.attrib.get("file")
                     if inc_file:
-                        inc_path = (
-                            inc_file
-                            if os.path.isabs(inc_file)
-                            else os.path.join(basedir, inc_file)
-                        )
+                        inc_path = inc_file if os.path.isabs(inc_file) else os.path.join(basedir, inc_file)
                         if os.path.exists(inc_path):
                             parse_materials_from_xml(inc_path, visited)
             except Exception as exc:
@@ -2474,11 +2307,7 @@ class ViserKeyframeEditor:
                     if not name and file:
                         name = os.path.splitext(os.path.basename(file))[0]
                     if name and file:
-                        fpath = (
-                            file
-                            if os.path.isabs(file)
-                            else os.path.join(asset_base, file)
-                        )
+                        fpath = file if os.path.isabs(file) else os.path.join(asset_base, file)
                         if os.path.exists(fpath):
                             self._mesh_file_map.setdefault(name, fpath)
                         scale_txt = mesh.attrib.get("scale")
@@ -2511,11 +2340,7 @@ class ViserKeyframeEditor:
                 for inc in root.findall(".//include"):
                     inc_file = inc.attrib.get("file")
                     if inc_file:
-                        inc_path = (
-                            inc_file
-                            if os.path.isabs(inc_file)
-                            else os.path.join(basedir, inc_file)
-                        )
+                        inc_path = inc_file if os.path.isabs(inc_file) else os.path.join(basedir, inc_file)
                         if os.path.exists(inc_path):
                             parse_xml_meshes(inc_path, visited)
             except Exception:
@@ -2536,9 +2361,7 @@ class ViserKeyframeEditor:
             geom_rgba = (
                 np.array(m.geom_rgba, dtype=np.float32)
                 if hasattr(m, "geom_rgba")
-                else np.tile(
-                    np.array([0.7, 0.7, 0.7, 1.0], dtype=np.float32), (m.ngeom, 1)
-                )
+                else np.tile(np.array([0.7, 0.7, 0.7, 1.0], dtype=np.float32), (m.ngeom, 1))
             )
             geom_group = (
                 np.array(m.geom_group, dtype=np.int32)
@@ -2571,21 +2394,11 @@ class ViserKeyframeEditor:
                 else np.zeros(m.ngeom, dtype=np.int32)
             )
             # Get material RGBA colors from MuJoCo
-            mat_rgba = (
-                np.array(m.mat_rgba, dtype=np.float32)
-                if hasattr(m, "mat_rgba") and m.nmat > 0
-                else None
-            )
+            mat_rgba = np.array(m.mat_rgba, dtype=np.float32) if hasattr(m, "mat_rgba") and m.nmat > 0 else None
         except Exception:
-            geom_type = np.array(
-                [m.geom(i).type for i in range(m.ngeom)], dtype=np.int32
-            )
-            geom_size = np.array(
-                [m.geom(i).size for i in range(m.ngeom)], dtype=np.float32
-            )
-            geom_rgba = np.tile(
-                np.array([0.7, 0.7, 0.7, 1.0], dtype=np.float32), (m.ngeom, 1)
-            )
+            geom_type = np.array([m.geom(i).type for i in range(m.ngeom)], dtype=np.int32)
+            geom_size = np.array([m.geom(i).size for i in range(m.ngeom)], dtype=np.float32)
+            geom_rgba = np.tile(np.array([0.7, 0.7, 0.7, 1.0], dtype=np.float32), (m.ngeom, 1))
             geom_group = np.zeros(m.ngeom, dtype=np.int32)
             geom_dataid = np.full(m.ngeom, -1, dtype=np.int32)
             geom_bodyid = np.full(m.ngeom, -1, dtype=np.int32)
@@ -2627,9 +2440,7 @@ class ViserKeyframeEditor:
             self._body_geom_indices.setdefault(body_id, []).append(i)
             self._geom_base_rgba[i] = rgba
             contype = int(geom_contype[i]) if geom_contype is not None else 0
-            conaffinity = (
-                int(geom_conaffinity[i]) if geom_conaffinity is not None else 0
-            )
+            conaffinity = int(geom_conaffinity[i]) if geom_conaffinity is not None else 0
             self._geom_is_collision[i] = bool(contype != 0 or conaffinity != 0)
 
             try:
@@ -2641,19 +2452,13 @@ class ViserKeyframeEditor:
             mesh = None
             try:
                 if gtype == int(mujoco.mjtGeom.mjGEOM_SPHERE):
-                    mesh = trimesh.creation.icosphere(
-                        radius=float(size[0]), subdivisions=3
-                    )
+                    mesh = trimesh.creation.icosphere(radius=float(size[0]), subdivisions=3)
                 elif gtype == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
                     height = float(2.0 * size[1])
-                    mesh = trimesh.creation.capsule(
-                        radius=float(size[0]), height=height, count=[16, 16]
-                    )
+                    mesh = trimesh.creation.capsule(radius=float(size[0]), height=height, count=[16, 16])
                 elif gtype == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
                     height = float(2.0 * size[1])
-                    mesh = trimesh.creation.cylinder(
-                        radius=float(size[0]), height=height, sections=24
-                    )
+                    mesh = trimesh.creation.cylinder(radius=float(size[0]), height=height, sections=24)
                 elif gtype == int(mujoco.mjtGeom.mjGEOM_BOX):
                     extents = 2.0 * size[:3]
                     mesh = trimesh.creation.box(extents=extents)
@@ -2682,22 +2487,16 @@ class ViserKeyframeEditor:
                             face_arr = np.asarray(mesh_face, dtype=np.int32)
                             verts = vert_arr[vadr : vadr + vnum]
                             faces = face_arr[fadr : fadr + fnum]
-                            mesh = trimesh.Trimesh(
-                                vertices=verts, faces=faces, process=False
-                            )
+                            mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
                             built = True
                         except Exception:
                             built = False
                     if not built and mid >= 0:
                         try:
-                            mesh_name = mujoco.mj_id2name(
-                                m, mujoco.mjtObj.mjOBJ_MESH, mid
-                            )
+                            mesh_name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_MESH, mid)
                         except Exception:
                             mesh_name = None
-                        fpath = (
-                            self._mesh_file_map.get(mesh_name) if mesh_name else None
-                        )
+                        fpath = self._mesh_file_map.get(mesh_name) if mesh_name else None
                         if fpath and os.path.exists(fpath):
                             try:
                                 mesh = trimesh.load(fpath, force="mesh")
@@ -2726,9 +2525,7 @@ class ViserKeyframeEditor:
                     int(rgba[2] * 255),
                     int(rgba[3] * 255),
                 ]
-                mesh.visual = trimesh.visual.ColorVisuals(
-                    mesh, face_colors=color_rgba_255
-                )
+                mesh.visual = trimesh.visual.ColorVisuals(mesh, face_colors=color_rgba_255)
             except Exception:
                 pass
 
@@ -2794,9 +2591,7 @@ class ViserKeyframeEditor:
         fade_indices: set[int] = set()
 
         # Root pose gizmo: fade root-body visuals so the gizmo is easier to see.
-        if self.root_pose_gizmo is not None and bool(
-            getattr(self.root_pose_gizmo, "visible", False)
-        ):
+        if self.root_pose_gizmo is not None and bool(getattr(self.root_pose_gizmo, "visible", False)):
             root_body_name = str(self.config.root_body or "")
             if root_body_name:
                 root_body_id = self._resolve_site_or_body_body_id(root_body_name)
@@ -2813,11 +2608,7 @@ class ViserKeyframeEditor:
 
     def _apply_geom_visibility(self) -> None:
         """Update visibility of robot geometry handles."""
-        show_collision = (
-            bool(self.collision_geom_checked.value)
-            if self.collision_geom_checked
-            else False
-        )
+        show_collision = bool(self.collision_geom_checked.value) if self.collision_geom_checked else False
         try:
             show_all = bool(self.show_all_geoms.value) if self.show_all_geoms else False
         except Exception:
@@ -2854,9 +2645,7 @@ class ViserKeyframeEditor:
                         fade_handle.visible = bool(visible and faded)
                     try:
                         if visible and faded:
-                            fade_handle.opacity = (
-                                None if alpha >= 0.995 else float(alpha)
-                            )
+                            fade_handle.opacity = None if alpha >= 0.995 else float(alpha)
                         else:
                             fade_handle.opacity = 0.0
                     except Exception:
@@ -2916,14 +2705,10 @@ class ViserKeyframeEditor:
                         xpos = np.array(self.data.geom_xpos, dtype=np.float32)
                         use_quat = True
                         try:
-                            xquat_wxyz = np.array(
-                                self.data.geom_xquat, dtype=np.float32
-                            )
+                            xquat_wxyz = np.array(self.data.geom_xquat, dtype=np.float32)
                         except Exception:
                             use_quat = False
-                            xmat = np.array(
-                                self.data.geom_xmat, dtype=np.float32
-                            ).reshape(-1, 3, 3)
+                            xmat = np.array(self.data.geom_xmat, dtype=np.float32).reshape(-1, 3, 3)
                     for index, handle in list(self._geom_handles.items()):
                         try:
                             position = tuple(map(float, xpos[index]))
@@ -2970,9 +2755,7 @@ class ViserKeyframeEditor:
                     times.append(t)
                     break
         if len(times) < 2:
-            print(
-                f"[Viser] Action traj: collected fewer than 2 timestamps.", flush=True
-            )
+            print("[Viser] Action traj: collected fewer than 2 timestamps.", flush=True)
             return
         times_arr = np.array(times)
         if np.any(np.diff(times_arr) <= 0):
@@ -2995,11 +2778,7 @@ class ViserKeyframeEditor:
             self.action_traj.append(motor_pos)
         traj_start = int(np.searchsorted(self.traj_times, times_arr[start_idx]))
         self.is_qpos_traj = False
-        self.is_relative_frame = (
-            bool(self.relative_frame_checked.value)
-            if self.relative_frame_checked
-            else True
-        )
+        self.is_relative_frame = bool(self.relative_frame_checked.value) if self.relative_frame_checked else True
         self.worker.request_trajectory_test(
             qpos_start,
             self.action_traj[traj_start:],
@@ -3023,7 +2802,7 @@ class ViserKeyframeEditor:
                     times.append(t)
                     break
         if len(times) < 2:
-            print(f"[Viser] Qpos traj: collected fewer than 2 timestamps.", flush=True)
+            print("[Viser] Qpos traj: collected fewer than 2 timestamps.", flush=True)
             return
 
         # Debug: check if qpos values are actually different
@@ -3039,9 +2818,7 @@ class ViserKeyframeEditor:
             )
         times_arr = np.array(times)
         if np.any(np.diff(times_arr) <= 0):
-            print(
-                f"[Viser] Qpos traj: times not strictly increasing: {times}", flush=True
-            )
+            print(f"[Viser] Qpos traj: times not strictly increasing: {times}", flush=True)
             return
         times_arr = times_arr - times_arr[0]
         self.traj_times = list(np.arange(0, times_arr[-1], self.dt))
@@ -3055,11 +2832,7 @@ class ViserKeyframeEditor:
                 qpos_t = qpos_arr[-1]
             qpos_traj.append(qpos_t)
         self.is_qpos_traj = True
-        self.is_relative_frame = (
-            bool(self.relative_frame_checked.value)
-            if self.relative_frame_checked
-            else True
-        )
+        self.is_relative_frame = bool(self.relative_frame_checked.value) if self.relative_frame_checked else True
         self.worker.request_trajectory_test(
             qpos_list[start_idx],
             qpos_traj[traj_start:],
@@ -3115,11 +2888,7 @@ class ViserKeyframeEditor:
             result_dict["timed_sequence"] = self.sequence_list
             result_dict["is_robot_relative_frame"] = self.is_relative_frame
 
-            motion_name = str(
-                self.motion_name_input.value
-                if self.motion_name_input
-                else self.config.name
-            ).strip()
+            motion_name = str(self.motion_name_input.value if self.motion_name_input else self.config.name).strip()
             if not motion_name:
                 motion_name = str(self.config.name)
             motion_name = motion_name.replace(" ", "_")
@@ -3205,9 +2974,7 @@ class ViserKeyframeEditor:
             if isinstance(raw_motion_name, str) and raw_motion_name.strip():
                 loaded_motion_name = raw_motion_name.strip().replace(" ", "_")
         if not loaded_motion_name and self.data_path:
-            loaded_motion_name = os.path.splitext(os.path.basename(self.data_path))[
-                0
-            ].replace(" ", "_")
+            loaded_motion_name = os.path.splitext(os.path.basename(self.data_path))[0].replace(" ", "_")
         if loaded_motion_name and self.motion_name_input is not None:
             self._set_handle_value(self.motion_name_input, loaded_motion_name)
 
@@ -3241,11 +3008,7 @@ class ViserKeyframeEditor:
             loaded_keyframes: List[Keyframe] = []
             joint_pos_order_warned = False
             for k in keyframes_data:
-                qpos_arr = (
-                    np.array(k["qpos"], dtype=np.float32)
-                    if k.get("qpos") is not None
-                    else None
-                )
+                qpos_arr = np.array(k["qpos"], dtype=np.float32) if k.get("qpos") is not None else None
                 if qpos_arr is not None and qpos_arr.shape[0] != self.model.nq:
                     # Keep keyframe entry but drop incompatible qpos.
                     print(
@@ -3255,21 +3018,14 @@ class ViserKeyframeEditor:
                     )
                     qpos_arr = None
                 stored_joint_pos = (
-                    np.array(k["joint_pos"], dtype=np.float32)
-                    if k.get("joint_pos") is not None
-                    else None
+                    np.array(k["joint_pos"], dtype=np.float32) if k.get("joint_pos") is not None else None
                 )
                 joint_pos_arr = stored_joint_pos
                 if qpos_arr is not None:
                     derived_joint_pos = self._get_joint_pos_from_qpos(qpos_arr)
                     joint_pos_arr = derived_joint_pos
-                    if (
-                        stored_joint_pos is not None
-                        and stored_joint_pos.shape == derived_joint_pos.shape
-                    ):
-                        max_diff = float(
-                            np.max(np.abs(stored_joint_pos - derived_joint_pos))
-                        )
+                    if stored_joint_pos is not None and stored_joint_pos.shape == derived_joint_pos.shape:
+                        max_diff = float(np.max(np.abs(stored_joint_pos - derived_joint_pos)))
                         if max_diff > 1e-3 and not joint_pos_order_warned:
                             print(
                                 "[Load] Detected legacy joint_pos ordering mismatch; "
@@ -3287,9 +3043,7 @@ class ViserKeyframeEditor:
                 )
             self.keyframes.extend(loaded_keyframes)
             sequence_entries = data.get("timed_sequence", [])
-            self.sequence_list = [
-                (n.replace(" ", "_"), float(t)) for (n, t) in sequence_entries
-            ]
+            self.sequence_list = [(n.replace(" ", "_"), float(t)) for (n, t) in sequence_entries]
             self.traj_times = list(map(float, data.get("time", [])))
             self.action_traj = data.get("action", [])
             self.qpos_replay = list(data.get("qpos", []))
@@ -3358,9 +3112,7 @@ class ViserKeyframeEditor:
             return
         name_to_remove = self.keyframes[self.selected_keyframe].name
         self.keyframes.pop(self.selected_keyframe)
-        self.sequence_list = [
-            (n, t) for (n, t) in self.sequence_list if n != name_to_remove
-        ]
+        self.sequence_list = [(n, t) for (n, t) in self.sequence_list if n != name_to_remove]
         self.selected_keyframe = None
         self._refresh_keyframes_table()
         self._refresh_sequence_table()
@@ -3473,8 +3225,7 @@ class ViserKeyframeEditor:
             items = tuple(kf.name for kf in self.keyframes)
             selected_idx = (
                 int(self.selected_keyframe)
-                if self.selected_keyframe is not None
-                and 0 <= self.selected_keyframe < len(self.keyframes)
+                if self.selected_keyframe is not None and 0 <= self.selected_keyframe < len(self.keyframes)
                 else -1
             )
             if selected_idx < 0:
@@ -3500,9 +3251,7 @@ class ViserKeyframeEditor:
         if self.keyframes_summary is None:
             return
         if not self.keyframes:
-            self.keyframes_summary.content = (
-                '<div style="font-size:0.875em; margin-left:0.75em">No keyframes</div>'
-            )
+            self.keyframes_summary.content = '<div style="font-size:0.875em; margin-left:0.75em">No keyframes</div>'
             return
         lines = [f"{i}: {kf.name}" for i, kf in enumerate(self.keyframes)]
         content = "<br/>".join(lines)
@@ -3522,14 +3271,10 @@ class ViserKeyframeEditor:
 
     def _refresh_sequence_summary(self) -> None:
         if self.sequence_list_widget is not None:
-            items = tuple(
-                f"{n}  |  t={self._format_sequence_time_display(t)}s"
-                for n, t in self.sequence_list
-            )
+            items = tuple(f"{n}  |  t={self._format_sequence_time_display(t)}s" for n, t in self.sequence_list)
             selected_idx = (
                 int(self.selected_sequence)
-                if self.selected_sequence is not None
-                and 0 <= self.selected_sequence < len(self.sequence_list)
+                if self.selected_sequence is not None and 0 <= self.selected_sequence < len(self.sequence_list)
                 else -1
             )
             if selected_idx < 0:
@@ -3555,9 +3300,7 @@ class ViserKeyframeEditor:
         if self.sequence_summary is None:
             return
         if not self.sequence_list:
-            self.sequence_summary.content = (
-                '<div style="font-size:0.875em; margin-left:0.75em">No sequence</div>'
-            )
+            self.sequence_summary.content = '<div style="font-size:0.875em; margin-left:0.75em">No sequence</div>'
             return
         lines = [
             f"{i}: {n.replace(' ', '_')} &nbsp;&nbsp; t={self._format_sequence_time_display(t)}"
@@ -3601,9 +3344,7 @@ class ViserKeyframeEditor:
         kf.qpos = synced_qpos.astype(np.float32)
         kf.joint_pos = self._get_joint_pos_from_qpos(kf.qpos)
         kf.motor_pos = self._get_motor_pos_from_qpos(kf.qpos)
-        physics_enabled = (
-            bool(self.physics_enabled.value) if self.physics_enabled else True
-        )
+        physics_enabled = bool(self.physics_enabled.value) if self.physics_enabled else True
         self.worker.request_keyframe_test(
             kf,
             self.dt,
@@ -3629,9 +3370,7 @@ class ViserKeyframeEditor:
     def _update_joint_pos(self, joint_name: str, value: float) -> Dict[str, float]:
         updates: Dict[str, float] = {joint_name: float(value)}
         mirror = bool(self.mirror_checked.value) if self.mirror_checked else True
-        rev_mirror = (
-            bool(self.rev_mirror_checked.value) if self.rev_mirror_checked else False
-        )
+        rev_mirror = bool(self.rev_mirror_checked.value) if self.rev_mirror_checked else False
         if mirror or rev_mirror:
             mirrored_joint_name = self._get_mirror_partner(joint_name)
             if mirrored_joint_name:
@@ -3686,15 +3425,11 @@ class ViserKeyframeEditor:
 
         for motion_joint in updates.keys():
             if motion_joint in self.differential_drives:
-                tendon_name, motor_list, motion_coef = self.differential_drives[
-                    motion_joint
-                ]
+                tendon_name, motor_list, motion_coef = self.differential_drives[motion_joint]
                 motor_names = frozenset(m[0] for m in motor_list)
                 if motor_names not in motor_groups:
                     motor_groups[motor_names] = []
-                motor_groups[motor_names].append(
-                    (motion_joint, tendon_name, motion_coef)
-                )
+                motor_groups[motor_names].append((motion_joint, tendon_name, motion_coef))
 
         # For each motor group, solve the system
         for motor_names, motion_list in motor_groups.items():
@@ -3705,9 +3440,7 @@ class ViserKeyframeEditor:
                 for motion_name, tendon_name, _ in motion_list:
                     # Find the tendon and get all coefficients
                     for tendon_id in range(self.model.ntendon):
-                        tn = mujoco.mj_id2name(
-                            self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id
-                        )
+                        tn = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_TENDON, tendon_id)
                         if tn == tendon_name:
                             adr = self.model.tendon_adr[tendon_id]
                             num = self.model.tendon_num[tendon_id]
@@ -3718,9 +3451,7 @@ class ViserKeyframeEditor:
                                 wrap_idx = adr + i
                                 obj_id = self.model.wrap_objid[wrap_idx]
                                 coef = float(self.model.wrap_prm[wrap_idx])
-                                jname = mujoco.mj_id2name(
-                                    self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id
-                                )
+                                jname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, obj_id)
 
                                 if jname in motor_names:
                                     motors.append((jname, coef))
@@ -3740,12 +3471,8 @@ class ViserKeyframeEditor:
 
                     # Get current or updated values
                     with self.worker_lock:
-                        roll_val = updates.get(
-                            r_name, float(self.data.joint(r_name).qpos[0])
-                        )
-                        yaw_val = updates.get(
-                            y_name, float(self.data.joint(y_name).qpos[0])
-                        )
+                        roll_val = updates.get(r_name, float(self.data.joint(r_name).qpos[0]))
+                        yaw_val = updates.get(y_name, float(self.data.joint(y_name).qpos[0]))
 
                     # Solve: c1*m1 + c2*m2 = -cr*roll
                     #        d1*m1 + d2*m2 = -dy*yaw
@@ -3786,7 +3513,11 @@ class ViserKeyframeEditor:
                     passive_rod_updates[rod_joint] = rod_value
         updates.update(passive_rod_updates)
 
-        self.worker.update_joint_angles(updates)
+        # Lock joints that have visible sliders — these are user-facing and should not be
+        # adjusted by the constraint solver.  Internal mechanism joints (motor, rod) don't
+        # have sliders and stay free.
+        locked = [j for j in updates if j in self.slider_widgets]
+        self.worker.update_joint_angles(updates, locked_joint_names=locked)
         return updates
 
     def _on_state(
@@ -3907,9 +3638,7 @@ class ViserKeyframeEditor:
             # Find sites attached to this body
             for site_id in range(self.model.nsite):
                 if self.model.site_bodyid[site_id] == body_id:
-                    site_name = mujoco.mj_id2name(
-                        self.model, mujoco.mjtObj.mjOBJ_SITE, site_id
-                    )
+                    site_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_SITE, site_id)
                     if not site_name:
                         continue
 
@@ -3949,27 +3678,17 @@ class ViserKeyframeEditor:
             "calf",
             "shin",
         ]
-        has_arm_like_entry = any(
-            any(kw in entry.lower() for kw in arm_ee_keywords) for entry in ee_sites
-        )
-        has_leg_like_entry = any(
-            any(kw in entry.lower() for kw in leg_ee_keywords) for entry in ee_sites
-        )
+        has_arm_like_entry = any(any(kw in entry.lower() for kw in arm_ee_keywords) for entry in ee_sites)
+        has_leg_like_entry = any(any(kw in entry.lower() for kw in leg_ee_keywords) for entry in ee_sites)
         if not has_arm_like_entry or not has_leg_like_entry:
             existing = {entry.lower() for entry in ee_sites}
             for body_id in leaf_body_ids:
-                body_name = mujoco.mj_id2name(
-                    self.model, mujoco.mjtObj.mjOBJ_BODY, body_id
-                )
+                body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
                 if body_name is None or body_name == "world":
                     continue
                 body_lower = body_name.lower()
-                arm_match = (not has_arm_like_entry) and any(
-                    kw in body_lower for kw in arm_ee_keywords
-                )
-                leg_match = (not has_leg_like_entry) and any(
-                    kw in body_lower for kw in leg_ee_keywords
-                )
+                arm_match = (not has_arm_like_entry) and any(kw in body_lower for kw in arm_ee_keywords)
+                leg_match = (not has_leg_like_entry) and any(kw in body_lower for kw in leg_ee_keywords)
                 if arm_match or leg_match:
                     if body_lower not in existing:
                         ee_sites.append(body_name)
@@ -3989,9 +3708,7 @@ class ViserKeyframeEditor:
                 "gripper",
             ]
             for body_id in leaf_body_ids:
-                body_name = mujoco.mj_id2name(
-                    self.model, mujoco.mjtObj.mjOBJ_BODY, body_id
-                )
+                body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
                 if body_name is None or body_name == "world":
                     continue
                 # Check if body name contains any end-effector keywords
@@ -4002,9 +3719,7 @@ class ViserKeyframeEditor:
             # If still no matches, just use all leaf bodies
             if not ee_sites:
                 for body_id in leaf_body_ids:
-                    body_name = mujoco.mj_id2name(
-                        self.model, mujoco.mjtObj.mjOBJ_BODY, body_id
-                    )
+                    body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
                     if body_name and body_name != "world":
                         ee_sites.append(body_name)
 
@@ -4040,13 +3755,9 @@ class ViserKeyframeEditor:
 
         def _classify_limb(name: str) -> Optional[str]:
             n = name.lower()
-            if any(
-                k in n for k in ["hand", "wrist", "palm", "gripper", "finger", "thumb"]
-            ):
+            if any(k in n for k in ["hand", "wrist", "palm", "gripper", "finger", "thumb"]):
                 return "arm"
-            if any(
-                k in n for k in ["foot", "ankle", "toe", "heel", "leg", "calf", "shin"]
-            ):
+            if any(k in n for k in ["foot", "ankle", "toe", "heel", "leg", "calf", "shin"]):
                 return "leg"
             return None
 
@@ -4110,13 +3821,9 @@ class ViserKeyframeEditor:
                 side = "right"
 
             limb: Optional[str] = None
-            if any(
-                k in n for k in ["hand", "wrist", "palm", "gripper", "finger", "thumb"]
-            ):
+            if any(k in n for k in ["hand", "wrist", "palm", "gripper", "finger", "thumb"]):
                 limb = "arm"
-            elif any(
-                k in n for k in ["foot", "ankle", "toe", "heel", "leg", "calf", "shin"]
-            ):
+            elif any(k in n for k in ["foot", "ankle", "toe", "heel", "leg", "calf", "shin"]):
                 limb = "leg"
 
             return side, limb
@@ -4155,17 +3862,11 @@ class ViserKeyframeEditor:
 
         shown_txt = ", ".join(shown_sites)
         if len(self._ik_target_sites) > len(shown_sites):
-            shown_txt += (
-                f", ... (+{len(self._ik_target_sites) - len(shown_sites)} more)"
-            )
+            shown_txt += f", ... (+{len(self._ik_target_sites) - len(shown_sites)} more)"
 
         with self.server.gui.add_folder("Inverse Kinematics (IK)"):
-            self.ik_targets_toggle_button = self.server.gui.add_button(
-                "Toggle Targets (T)"
-            )
-            self.ik_targets_status = self.server.gui.add_markdown(
-                f"_Available targets_: `{shown_txt}`"
-            )
+            self.ik_targets_toggle_button = self.server.gui.add_button("Toggle Targets (T)")
+            self.ik_targets_status = self.server.gui.add_markdown(f"_Available targets_: `{shown_txt}`")
 
             @self.ik_targets_toggle_button.on_click
             def _(_e: GuiEvent) -> None:
@@ -4184,12 +3885,7 @@ class ViserKeyframeEditor:
         with self.server.gui.add_folder("End-Effector Pose Anchors"):
             self.server.gui.add_markdown("_Per-site pose tools_: save/apply only.")
             for site_name in shown_sites:
-                short_name = (
-                    site_name.replace("_center", "")
-                    .replace("_site", "")
-                    .replace("_", " ")
-                    .title()
-                )
+                short_name = site_name.replace("_center", "").replace("_site", "").replace("_", " ").title()
 
                 save_btn = self.server.gui.add_button(f"Save {short_name}")
 
@@ -4210,11 +3906,6 @@ class ViserKeyframeEditor:
                         self._align_to_pose(sname, self.saved_ee_poses[sname])
                     else:
                         print(f"[Viser] No saved pose for {sname}.", flush=True)
-
-    def _get_site_or_body_position(self, site_name: str) -> np.ndarray:
-        """Return world position for a site or body name."""
-        pos, _quat = self._get_site_or_body_pose(site_name)
-        return pos
 
     def _get_site_or_body_pose(self, site_name: str) -> Tuple[np.ndarray, np.ndarray]:
         """Return world pose (position, wxyz quaternion) for a site or body name."""
@@ -4245,25 +3936,14 @@ class ViserKeyframeEditor:
                 initial_quat = self.ee_target_orientations.get(site_name, current_quat)
             except Exception:
                 continue
-            self.ee_target_positions[site_name] = np.asarray(
-                initial_pos, dtype=np.float64
-            )
-            self.ee_target_orientations[site_name] = np.asarray(
-                initial_quat, dtype=np.float64
-            )
+            self.ee_target_positions[site_name] = np.asarray(initial_pos, dtype=np.float64)
+            self.ee_target_orientations[site_name] = np.asarray(initial_quat, dtype=np.float64)
             roll0, pitch0, yaw0 = self._quat_to_euler(
                 np.asarray(self.ee_target_orientations[site_name], dtype=np.float64)
             )
 
-            short_name = (
-                site_name.replace("_center", "")
-                .replace("_site", "")
-                .replace("_", " ")
-                .title()
-            )
-            with self.server.gui.add_folder(
-                short_name, expand_by_default=False
-            ) as target_folder:
+            short_name = site_name.replace("_center", "").replace("_site", "").replace("_", " ").title()
+            with self.server.gui.add_folder(short_name, expand_by_default=False) as target_folder:
 
                 def _safe_slider(label, lo, hi, step, val):
                     """Create slider with range expanded to fit initial value."""
@@ -4275,21 +3955,11 @@ class ViserKeyframeEditor:
                         initial_value=val,
                     )
 
-                x_slider = _safe_slider(
-                    "X (m)", -3.0, 3.0, 0.005, float(initial_pos[0])
-                )
-                y_slider = _safe_slider(
-                    "Y (m)", -3.0, 3.0, 0.005, float(initial_pos[1])
-                )
-                z_slider = _safe_slider(
-                    "Z (m)", -0.2, 2.5, 0.005, float(initial_pos[2])
-                )
-                roll_slider = _safe_slider(
-                    "Roll (rad)", -3.14, 3.14, 0.01, float(roll0)
-                )
-                pitch_slider = _safe_slider(
-                    "Pitch (rad)", -3.14, 3.14, 0.01, float(pitch0)
-                )
+                x_slider = _safe_slider("X (m)", -3.0, 3.0, 0.005, float(initial_pos[0]))
+                y_slider = _safe_slider("Y (m)", -3.0, 3.0, 0.005, float(initial_pos[1]))
+                z_slider = _safe_slider("Z (m)", -0.2, 2.5, 0.005, float(initial_pos[2]))
+                roll_slider = _safe_slider("Roll (rad)", -3.14, 3.14, 0.01, float(roll0))
+                pitch_slider = _safe_slider("Pitch (rad)", -3.14, 3.14, 0.01, float(pitch0))
                 yaw_slider = _safe_slider("Yaw (rad)", -3.14, 3.14, 0.01, float(yaw0))
                 for slider in (
                     x_slider,
@@ -4374,9 +4044,7 @@ class ViserKeyframeEditor:
                 folder.expand_by_default = False
 
         if self.ik_targets_toggle_button is not None:
-            self.ik_targets_toggle_button.label = (
-                "Clear Targets (T)" if targets_active else "Create Targets (T)"
-            )
+            self.ik_targets_toggle_button.label = "Clear Targets (T)" if targets_active else "Create Targets (T)"
 
         if self.ik_targets_status is not None:
             names = ", ".join(self._ik_target_sites)
@@ -4421,9 +4089,7 @@ class ViserKeyframeEditor:
             site_t_curr = self._get_site_transform(site_name)
             aligned_root_t = target_pose @ np.linalg.inv(site_t_curr) @ root_t_curr
             self.data.qpos[:3] = aligned_root_t[:3, 3]
-            self.data.qpos[3:7] = R.from_matrix(aligned_root_t[:3, :3]).as_quat(
-                scalar_first=True
-            )
+            self.data.qpos[3:7] = R.from_matrix(aligned_root_t[:3, :3]).as_quat(scalar_first=True)
             self._forward()
         print(f"[Viser] {site_name} aligned to saved pose.", flush=True)
 
@@ -4464,9 +4130,7 @@ class ViserKeyframeEditor:
                 )
         return ok, final_err
 
-    def _make_mink_target_pose(
-        self, target_pos: np.ndarray, target_wxyz: Optional[np.ndarray]
-    ) -> object:
+    def _make_mink_target_pose(self, target_pos: np.ndarray, target_wxyz: Optional[np.ndarray]) -> object:
         """Construct an SE3 target for Mink from position and optional orientation."""
         target_pos = np.asarray(target_pos, dtype=np.float64)
         if target_wxyz is None:
@@ -4519,9 +4183,7 @@ class ViserKeyframeEditor:
         self._set_ik_target_ui_state(True)
         self._apply_geom_visibility()
 
-    def _create_ee_targets(
-        self, sites: List[str], *, reset_to_current: bool = False
-    ) -> None:
+    def _create_ee_targets(self, sites: List[str], *, reset_to_current: bool = False) -> None:
         """Create draggable scene gizmos for end-effector IK targets."""
         self._clear_ee_targets(clear_positions=False)
 
@@ -4658,15 +4320,11 @@ class ViserKeyframeEditor:
             target_frames: List[Tuple[str, str, int, int, np.ndarray, np.ndarray]] = []
             tasks: List[object] = []
             for site_name, target_pos, target_quat in targets:
-                site_id = mujoco.mj_name2id(
-                    self.model, mujoco.mjtObj.mjOBJ_SITE, site_name
-                )
+                site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, site_name)
                 body_id = -1
                 frame_type = "site"
                 if site_id < 0:
-                    body_id = mujoco.mj_name2id(
-                        self.model, mujoco.mjtObj.mjOBJ_BODY, site_name
-                    )
+                    body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, site_name)
                     if body_id < 0:
                         results.append((site_name, False, float("inf")))
                         continue
@@ -4686,9 +4344,7 @@ class ViserKeyframeEditor:
                     )
                 )
                 tasks.append(frame_task)
-                target_frames.append(
-                    (site_name, frame_type, site_id, body_id, target_pos, target_quat)
-                )
+                target_frames.append((site_name, frame_type, site_id, body_id, target_pos, target_quat))
 
             if tasks:
                 root_task = self._make_mink_root_lock_task(cfg)
@@ -4714,32 +4370,14 @@ class ViserKeyframeEditor:
                         target_quat,
                     ) in enumerate(target_frames):
                         if site_id >= 0:
-                            curr_pos = (
-                                cfg.data.site(int(site_id))
-                                .xpos.copy()
-                                .astype(np.float64)
-                            )
-                            curr_mat = (
-                                cfg.data.site(int(site_id)).xmat.reshape(3, 3).copy()
-                            )
+                            curr_pos = cfg.data.site(int(site_id)).xpos.copy().astype(np.float64)
+                            curr_mat = cfg.data.site(int(site_id)).xmat.reshape(3, 3).copy()
                         else:
-                            curr_pos = (
-                                cfg.data.xpos[int(body_id)].copy().astype(np.float64)
-                            )
+                            curr_pos = cfg.data.xpos[int(body_id)].copy().astype(np.float64)
                             curr_mat = cfg.data.xmat[int(body_id)].reshape(3, 3).copy()
-                        curr_errors[i] = float(
-                            np.linalg.norm(
-                                np.asarray(target_pos, dtype=np.float64) - curr_pos
-                            )
-                        )
-                        curr_quat = (
-                            R.from_matrix(curr_mat)
-                            .as_quat(scalar_first=True)
-                            .astype(np.float64)
-                        )
-                        rot_delta = R.from_quat(
-                            curr_quat, scalar_first=True
-                        ).inv() * R.from_quat(
+                        curr_errors[i] = float(np.linalg.norm(np.asarray(target_pos, dtype=np.float64) - curr_pos))
+                        curr_quat = R.from_matrix(curr_mat).as_quat(scalar_first=True).astype(np.float64)
+                        rot_delta = R.from_quat(curr_quat, scalar_first=True).inv() * R.from_quat(
                             np.asarray(target_quat, dtype=np.float64), scalar_first=True
                         )
                         curr_rot_errors[i] = float(rot_delta.magnitude())
@@ -4793,9 +4431,7 @@ class ViserKeyframeEditor:
         self.worker.request_state_data()
 
         if not quiet:
-            result_txt = ", ".join(
-                f"{name}:{err:.3f}m{'*' if not ok else ''}" for name, ok, err in results
-            )
+            result_txt = ", ".join(f"{name}:{err:.3f}m{'*' if not ok else ''}" for name, ok, err in results)
             print(f"[Viser][IK] Target solve done ({result_txt})", flush=True)
 
     def _build_mink_velocity_limits(self) -> Dict[str, float]:
@@ -4843,9 +4479,7 @@ class ViserKeyframeEditor:
                 orientation_cost=20.0,
                 lm_damping=1e-3,
             )
-            root_task.set_target(
-                cfg.get_transform_frame_to_world(self.config.root_body, "body")
-            )
+            root_task.set_target(cfg.get_transform_frame_to_world(self.config.root_body, "body"))
             return root_task
         except Exception as exc:
             if not self._mink_root_lock_warned:
@@ -4882,17 +4516,13 @@ class ViserKeyframeEditor:
             frame_name=site_name,
             frame_type=frame_type,
             position_cost=1.0,
-            orientation_cost=self._ik_orientation_cost
-            if target_wxyz is not None
-            else 0.0,
+            orientation_cost=self._ik_orientation_cost if target_wxyz is not None else 0.0,
             lm_damping=1e-3,
         )
         frame_task.set_target(
             self._make_mink_target_pose(
                 np.asarray(target_pos, dtype=np.float64),
-                np.asarray(target_wxyz, dtype=np.float64)
-                if target_wxyz is not None
-                else None,
+                np.asarray(target_wxyz, dtype=np.float64) if target_wxyz is not None else None,
             )
         )
         tasks = [frame_task]
@@ -4914,26 +4544,20 @@ class ViserKeyframeEditor:
             else:
                 curr_pos = cfg.data.xpos[body_id].copy().astype(np.float64)
                 curr_mat = cfg.data.xmat[body_id].reshape(3, 3).copy()
-            err_norm = float(
-                np.linalg.norm(np.asarray(target_pos, dtype=np.float64) - curr_pos)
-            )
+            err_norm = float(np.linalg.norm(np.asarray(target_pos, dtype=np.float64) - curr_pos))
 
             rot_err = 0.0
             if target_wxyz is not None:
-                curr_quat = (
-                    R.from_matrix(curr_mat)
-                    .as_quat(scalar_first=True)
-                    .astype(np.float64)
-                )
+                curr_quat = R.from_matrix(curr_mat).as_quat(scalar_first=True).astype(np.float64)
                 target_quat = np.asarray(target_wxyz, dtype=np.float64)
                 qn = float(np.linalg.norm(target_quat))
                 if qn > 1e-12:
                     target_quat = target_quat / qn
                 else:
                     target_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-                rot_delta = R.from_quat(
-                    curr_quat, scalar_first=True
-                ).inv() * R.from_quat(target_quat, scalar_first=True)
+                rot_delta = R.from_quat(curr_quat, scalar_first=True).inv() * R.from_quat(
+                    target_quat, scalar_first=True
+                )
                 rot_err = float(rot_delta.magnitude())
 
             score = err_norm + 0.25 * rot_err
@@ -4984,9 +4608,7 @@ class ViserKeyframeEditor:
 
             row2 = self.server.gui.add_columns(2, widths=(1.0, 1.0))
             with row2[0]:
-                self.physics_enabled = self.server.gui.add_checkbox(
-                    "Enable Physics", True
-                )
+                self.physics_enabled = self.server.gui.add_checkbox("Enable Physics", True)
             with row2[1]:
                 self.relative_frame_checked = self.server.gui.add_checkbox(
                     "Use Robot Frame",
@@ -5043,11 +4665,7 @@ class ViserKeyframeEditor:
 
     def _apply_com_visibility(self) -> None:
         """Toggle visibility of the center of mass sphere."""
-        show_com = (
-            bool(self.show_com_checked.value)
-            if self.show_com_checked
-            else self.config.show_com
-        )
+        show_com = bool(self.show_com_checked.value) if self.show_com_checked else self.config.show_com
 
         if show_com:
             # Create COM sphere if it doesn't exist
@@ -5178,7 +4796,6 @@ def main() -> None:
         args.xml_path,
         config=config,
         data_path=args.data,
-        # start_keyframe=args.start_keyframe,
     )
 
     # Get actual port from viser server
@@ -5187,7 +4804,7 @@ def main() -> None:
     except Exception:
         port = 8080
 
-    print(f"\n🚀 Keyframe Editor running!")
+    print("\n🚀 Keyframe Editor running!")
     print(f"   Open http://localhost:{port} in your browser\n")
 
     try:
