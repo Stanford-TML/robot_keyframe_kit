@@ -667,8 +667,14 @@ class SimWorker(threading.Thread):
             aligned_torso_t = torso_t_curr.copy()
             aligned_torso_t[2, 3] -= dz
 
-            self.data.qpos[:3] = aligned_torso_t[:3, 3]
-            self.data.qpos[3:7] = R.from_matrix(aligned_torso_t[:3, :3]).as_quat(scalar_first=True)
+            if self.q_start_idx == 7:
+                # Floating base: write position + quaternion into freejoint qpos.
+                self.data.qpos[:3] = aligned_torso_t[:3, 3]
+                self.data.qpos[3:7] = R.from_matrix(aligned_torso_t[:3, :3]).as_quat(scalar_first=True)
+            else:
+                # Fixed base: no freejoint to adjust, skip ground placement.
+                print("[Ground] No freejoint — skipping ground placement", flush=True)
+                return
             self._forward()
             print(
                 f"[Ground] Placed robot on ground (moved down {dz:.4f}m, lowest geom was at z={lowest_z:.4f}m)",
