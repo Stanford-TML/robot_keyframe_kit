@@ -143,9 +143,8 @@ class ViserKeyframeEditor:
         mujoco.mj_forward(self.model, self.data)
         self._apply_model_based_gizmo_scale()
 
-        # Set up save directory: {save_dir}/{name}/
-        # Files will be saved as {motion_name}_{timestamp}.lz4
-        self.result_dir = os.path.join(config.save_dir, config.name)
+        # Set up save directory (flat): files saved as {name}.lz4
+        self.result_dir = config.save_dir
         os.makedirs(self.result_dir, exist_ok=True)
         self.data_path = data_path
 
@@ -2974,8 +2973,8 @@ class ViserKeyframeEditor:
                 loaded_motion_name = raw_motion_name.strip().replace(" ", "_")
         if not loaded_motion_name and self.data_path:
             loaded_motion_name = os.path.splitext(os.path.basename(self.data_path))[0].replace(" ", "_")
-        if loaded_motion_name and self.motion_name_input is not None:
-            self._set_handle_value(self.motion_name_input, loaded_motion_name)
+        if self.motion_name_input is not None:
+            self._set_handle_value(self.motion_name_input, self.config.name)
 
         # Validate qpos dimensionality early to avoid hard crashes when loading
         # motion files created for a different robot model.
