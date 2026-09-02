@@ -45,6 +45,9 @@ dev = [
     "black",
     "ruff",
 ]
+video = [
+    "opencv-python-headless>=4.10",
+]
 
 [project.urls]
 Homepage = "https://github.com/Stanford-TML/robot_keyframe_kit"
@@ -52,6 +55,7 @@ Repository = "https://github.com/Stanford-TML/robot_keyframe_kit"
 
 [project.scripts]
 keyframe-editor = "robot_keyframe_kit.editor:main"
+keyframe-video = "robot_keyframe_kit.video.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
